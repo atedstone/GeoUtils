@@ -198,9 +198,9 @@ class Vector:
 
         # Ensure that the vector is in the same crs as a reference
         if isinstance(ref_crs, (gu.Raster, rio.io.DatasetReader, Vector, gpd.GeoDataFrame, str)):
-            vect_reproj = self.reproject(dst_ref=ref_crs)
+            vect_reproj = self.reproject(ref=ref_crs)
         elif isinstance(ref_crs, (CRS, int)):
-            vect_reproj = self.reproject(dst_crs=ref_crs)
+            vect_reproj = self.reproject(crs=ref_crs)
         else:
             vect_reproj = self
 
@@ -1041,8 +1041,8 @@ class Vector:
 
     def reproject(
         self: Vector,
-        dst_ref: gu.Raster | rio.io.DatasetReader | VectorType | gpd.GeoDataFrame | str | None = None,
-        dst_crs: CRS | str | int | None = None,
+        ref: gu.Raster | rio.io.DatasetReader | VectorType | gpd.GeoDataFrame | str | None = None,
+        crs: CRS | str | int | None = None,
     ) -> Vector:
         """
         Reproject vector to a specified coordinate reference system.
@@ -1053,51 +1053,51 @@ class Vector:
 
         To reproject a Vector with different source bounds, first run Vector.crop().
 
-        :param dst_ref: A reference raster or vector whose CRS to use as a reference for reprojection.
+        :param ref: A reference raster or vector whose CRS to use as a reference for reprojection.
             Can be provided as a raster, vector, Rasterio dataset, GeoPandas dataframe, or path to the file.
-        :param dst_crs: Specify the Coordinate Reference System or EPSG to reproject to. If dst_ref not set,
+        :param crs: Specify the Coordinate Reference System or EPSG to reproject to. If dst_ref not set,
             defaults to self.crs.
 
         :returns: Reprojected vector.
         """
 
-        # Check that either dst_ref or dst_crs is provided
-        if (dst_ref is not None and dst_crs is not None) or (dst_ref is None and dst_crs is None):
-            raise ValueError("Either of `dst_ref` or `dst_crs` must be set. Not both.")
+        # Check that either ref or crs is provided
+        if (ref is not None and crs is not None) or (ref is None and crs is None):
+            raise ValueError("Either of `ref` or `crs` must be set. Not both.")
 
         # Case a raster or vector is provided as reference
-        if dst_ref is not None:
-            # Check that dst_ref type is either str, Raster or rasterio data set
+        if ref is not None:
+            # Check that ref type is either str, Raster or rasterio data set
             # Preferably use Raster instance to avoid rasterio data set to remain open. See PR #45
-            if isinstance(dst_ref, (gu.Raster, gu.Vector)):
-                ds_ref = dst_ref
-            elif isinstance(dst_ref, (rio.io.DatasetReader, gpd.GeoDataFrame)):
-                ds_ref = dst_ref
-            elif isinstance(dst_ref, str):
-                if not os.path.exists(dst_ref):
+            if isinstance(ref, (gu.Raster, gu.Vector)):
+                ds_ref = ref
+            elif isinstance(ref, (rio.io.DatasetReader, gpd.GeoDataFrame)):
+                ds_ref = ref
+            elif isinstance(ref, str):
+                if not os.path.exists(ref):
                     raise ValueError("Reference raster or vector path does not exist.")
                 try:
-                    ds_ref = gu.Raster(dst_ref, load_data=False)
+                    ds_ref = gu.Raster(ref, load_data=False)
                 except rasterio.errors.RasterioIOError:
                     try:
-                        ds_ref = Vector(dst_ref)
+                        ds_ref = Vector(ref)
                     except fiona.errors.DriverError:
                         raise ValueError("Could not open raster or vector with rasterio or fiona.")
             else:
-                raise TypeError("Type of dst_ref must be string path to file, Raster or Vector.")
+                raise TypeError("Type of ref must be string path to file, Raster or Vector.")
 
             # Read reprojecting params from ref raster
-            dst_crs = ds_ref.crs
+            crs = ds_ref.crs
         else:
             # Determine user-input target CRS
-            dst_crs = CRS.from_user_input(dst_crs)
+            crs = CRS.from_user_input(crs)
 
-        return Vector(self.ds.to_crs(crs=dst_crs))
+        return Vector(self.ds.to_crs(crs=crs))
 
     @overload
     def create_mask(
         self,
-        rst: str | gu.Raster | None = None,
+        raster: str | gu.Raster | None = None,
         crs: CRS | None = None,
         xres: float | None = None,
         yres: float | None = None,
@@ -1111,7 +1111,7 @@ class Vector:
     @overload
     def create_mask(
         self,
-        rst: str | gu.Raster | None = None,
+        raster: str | gu.Raster | None = None,
         crs: CRS | None = None,
         xres: float | None = None,
         yres: float | None = None,
@@ -1124,7 +1124,7 @@ class Vector:
 
     def create_mask(
         self,
-        rst: gu.Raster | None = None,
+        raster: gu.Raster | None = None,
         crs: CRS | None = None,
         xres: float | None = None,
         yres: float | None = None,
@@ -1142,11 +1142,11 @@ class Vector:
 
         Vector features which fall outside the bounds of the raster file are not written to the new mask file.
 
-        :param rst: Reference raster to match during rasterization.
-        :param crs: A pyproj or rasterio CRS object (Default to rst.crs if not None then self.crs)
-        :param xres: Output raster spatial resolution in x. Only is rst is None.
-        :param yres: Output raster spatial resolution in y. Only if rst is None. (Default to xres)
-        :param bounds: Output raster bounds (left, bottom, right, top). Only if rst is None (Default to self bounds)
+        :param raster: Reference raster to match during rasterization.
+        :param crs: A pyproj or rasterio CRS object (Default to raster.crs if not None then self.crs)
+        :param xres: Output raster spatial resolution in x. Only is raster is None.
+        :param yres: Output raster spatial resolution in y. Only if raster is None. (Default to xres)
+        :param bounds: Output raster bounds (left, bottom, right, top). Only if raster is None (Default to self bounds)
         :param buffer: Size of buffer to be added around the features, in the raster's projection units.
             If a negative value is set, will erode the features.
         :param as_array: Return mask as a boolean array
@@ -1154,11 +1154,11 @@ class Vector:
         :returns: A Mask object contain a boolean array
         """
 
-        # If no rst given, use provided dimensions
-        if rst is None:
+        # If no raster given, use provided dimensions
+        if raster is None:
             # At minimum, xres must be set
             if xres is None:
-                raise ValueError("At least rst or xres must be set.")
+                raise ValueError("At least raster or xres must be set.")
             if yres is None:
                 yres = xres
 
@@ -1188,12 +1188,12 @@ class Vector:
             # Calculate raster transform
             transform = rio.transform.from_bounds(left, bottom, right, top, width, height)
 
-        # otherwise use directly rst's dimensions
-        elif isinstance(rst, gu.Raster):
-            out_shape = rst.shape
-            transform = rst.transform
-            crs = rst.crs
-            bounds = rst.bounds
+        # otherwise use directly raster's dimensions
+        elif isinstance(raster, gu.Raster):
+            out_shape = raster.shape
+            transform = raster.transform
+            crs = raster.crs
+            bounds = raster.bounds
         else:
             raise TypeError("Raster must be a geoutils.Raster or None.")
 
@@ -1205,7 +1205,7 @@ class Vector:
         x1, y1, x2, y2 = warp.transform_bounds(crs, gdf.crs, left, bottom, right, top)
         gdf = gdf.cx[x1:x2, y1:y2]
 
-        # Reproject vector into rst CRS
+        # Reproject vector into raster CRS
         gdf = gdf.to_crs(crs)
 
         # Create a buffer around the features
@@ -1221,9 +1221,9 @@ class Vector:
             shapes=gdf.geometry, fill=0, out_shape=out_shape, transform=transform, default_value=1, dtype="uint8"
         ).astype("bool")
 
-        # Force output mask to be of same dimension as input rst
-        if rst is not None:
-            mask = mask.reshape((rst.count, rst.height, rst.width))  # type: ignore
+        # Force output mask to be of same dimension as input raster
+        if raster is not None:
+            mask = mask.reshape((raster.count, raster.height, raster.width))  # type: ignore
 
         # Return output as mask or as array
         if as_array:
@@ -1233,7 +1233,7 @@ class Vector:
 
     def rasterize(
         self,
-        rst: gu.Raster | None = None,
+        raster: gu.Raster | None = None,
         crs: CRS | int | None = None,
         xres: float | None = None,
         yres: float | None = None,
@@ -1252,13 +1252,14 @@ class Vector:
         Burn value is set by user and can be either a single number, or an iterable of same length as self.ds.
         Default is an index from 1 to len(self.ds).
 
-        :param rst: Reference raster to match during rasterization.
-        :param crs: Coordinate reference system as string or EPSG code (Default to rst.crs if not None then self.crs).
-        :param xres: Output raster spatial resolution in x. Only if rst is None.
+        :param raster: Reference raster to match during rasterization.
+        :param crs: Coordinate reference system as string or EPSG code
+            (Default to raster.crs if not None then self.crs).
+        :param xres: Output raster spatial resolution in x. Only if raster is None.
             Must be in units of crs, if set.
-        :param yres: Output raster spatial resolution in y. Only if rst is None.
+        :param yres: Output raster spatial resolution in y. Only if raster is None.
             Must be in units of crs, if set. (Default to xres).
-        :param bounds: Output raster bounds (left, bottom, right, top). Only if rst is None.
+        :param bounds: Output raster bounds (left, bottom, right, top). Only if raster is None.
             Must be in same system as crs, if set. (Default to self bounds).
         :param in_value: Value(s) to be burned inside the polygons (Default is self.ds.index + 1).
         :param out_value: Value to be burned outside the polygons (Default is 0).
@@ -1266,24 +1267,24 @@ class Vector:
         :returns: Raster or mask containing the burned geometries.
         """
 
-        if (rst is not None) and (crs is not None):
-            raise ValueError("Only one of rst or crs can be provided.")
+        if (raster is not None) and (crs is not None):
+            raise ValueError("Only one of raster or crs can be provided.")
 
         # Reproject vector into requested CRS or rst CRS first, if needed
         # This has to be done first so that width/height calculated below are correct!
         if crs is None:
             crs = self.ds.crs
 
-        if rst is not None:
-            crs = rst.crs  # type: ignore
+        if raster is not None:
+            crs = raster.crs  # type: ignore
 
         vect = self.ds.to_crs(crs)
 
-        # If no rst given, now use provided dimensions
-        if rst is None:
+        # If no raster given, now use provided dimensions
+        if raster is None:
             # At minimum, xres must be set
             if xres is None:
-                raise ValueError("At least rst or xres must be set.")
+                raise ValueError("At least raster or xres must be set.")
             if yres is None:
                 yres = xres
 
@@ -1306,10 +1307,10 @@ class Vector:
             # Calculate raster transform
             transform = rio.transform.from_bounds(left, bottom, right, top, width, height)
 
-        # otherwise use directly rst's dimensions
+        # otherwise use directly raster's dimensions
         else:
-            out_shape = rst.shape  # type: ignore
-            transform = rst.transform  # type: ignore
+            out_shape = raster.shape  # type: ignore
+            transform = raster.transform  # type: ignore
 
         # Set default burn value, index from 1 to len(self.ds)
         if in_value is None:

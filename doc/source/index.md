@@ -111,6 +111,7 @@ geotransformations
 raster_vector_point
 distance_ops
 stats
+filters
 ```
 
 ```{toctree}
@@ -129,6 +130,7 @@ analysis_examples/index
 api
 cli
 config
+data
 release_notes
 ```
 

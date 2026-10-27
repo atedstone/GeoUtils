@@ -5,10 +5,12 @@ Tests for multiprocessing functions
 import os
 import warnings
 from multiprocessing import cpu_count
-from typing import Any
+from pathlib import Path
+from typing import Any, Iterator
 
 import numpy as np
 import pytest
+import rasterio as rio
 import scipy
 from numpy import floating
 
@@ -20,11 +22,16 @@ from geoutils.multiproc.cluster import (
 )
 from geoutils.multiproc.mparray import (
     MultiprocConfig,
+    _add_tile_padding,
     _apply_func_block,
     _generate_tiling_grid,
     _load_raster_tile,
     _remove_tile_padding,
+    block_bounds_from_chunks,
+    compute_tiling,
+    map_collect,
     map_multiproc_collect,
+    map_overlap,
     map_overlap_multiproc_save,
 )
 from geoutils.raster import RasterType
@@ -48,7 +55,7 @@ def _custom_func(raster: Raster, addition: float, factor: float) -> Raster:
 def _custom_func_stats(raster: RasterType) -> dict[str, floating[Any]]:
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", category=UserWarning, message="Empty raster")
-        return raster.get_stats(stats_name=["mean", "valid_count"])
+        return raster.stats(["mean", "valid_count"], values=1)  # type: ignore
 
 
 # Define a simple function which return a Mask
@@ -57,8 +64,25 @@ def _custom_func_mask(raster: RasterType) -> gu.Raster:
     return gu.Raster.from_array(mask_array, raster.transform, raster.crs)
 
 
-class TestTiling:
+def _custom_func_bands(raster: Raster, n_bands: int) -> Raster:
+    """
+    Return the first source band with known offsets, custom metadata and the worker's process identifier.
+    """
 
+    # Add a distinct constant to each output band so nodata or misordered bands are visible
+    first_band = raster.data[0] if raster.count > 1 else raster.data
+    bands = np.ma.stack([first_band + index for index in range(n_bands)])
+    tags: dict[str, Any] = {
+        "operation": "band offsets",
+        "long_name": tuple(f"band_{index}" for index in range(n_bands)),
+    }
+    tags["worker_pid"] = os.getpid()
+
+    # Use the tile's grid but deliberately change its pixel interpretation to check result metadata
+    return Raster.from_array(bands, raster.transform, raster.crs, nodata=-99999, area_or_point="Point", tags=tags)
+
+
+class TestTiling:
     landsat_b4_path = examples.get_path_test("everest_landsat_b4")
 
     @pytest.mark.parametrize("overlap", [0, 5])
@@ -145,13 +169,113 @@ class TestTiling:
         with pytest.raises(TypeError):
             _generate_tiling_grid(0, 0, 100, 100, 50, 50, 0.5)  # type: ignore
 
+    def test_block_bounds_from_chunks(self) -> None:
+        """Expand rectangular chunk bounds by overlap and clip them to the raster."""
+
+        # Two row chunks and three column chunks cover the non-divisible shape
+        block_bounds = block_bounds_from_chunks(chunks=(50, 25), shape=(100, 55), overlap=5)
+
+        # Outer blocks stay clipped while their inner edges include support pixels
+        assert block_bounds.shape == (2, 3, 4)
+        assert np.array_equal(block_bounds[0, 0], np.array([0, 55, 0, 30]))
+        assert np.array_equal(block_bounds[-1, -1], np.array([45, 100, 45, 55]))
+
+    def test_compute_tiling_rectangular_chunks(self) -> None:
+        """Create the expected row-major tiling for unequal row and column chunks."""
+
+        tiling = compute_tiling(tile_size=(40, 25), raster_shape=(100, 55), overlap=5)
+
+        # Spell out all windows to make their order and clipped edges explicit
+        expected_tiling = np.array(
+            [
+                [[0, 45, 0, 30], [0, 45, 20, 55]],
+                [[35, 85, 0, 30], [35, 85, 20, 55]],
+                [[75, 100, 0, 30], [75, 100, 20, 55]],
+            ]
+        )
+        assert np.array_equal(tiling, expected_tiling)
+
 
 class TestMultiproc:
+    """Check multiprocessing raster helpers, configuration and chunk layouts."""
+
     aster_dem_path = examples.get_path_test("exploradores_aster_dem")
     landsat_rgb_path = examples.get_path_test("everest_landsat_rgb")
 
-    num_workers = min(2, cpu_count())  # Safer limit for CI
-    cluster = ClusterGenerator("test", nb_workers=num_workers)
+    @pytest.fixture(scope="class", params=[None, "test"])
+    @classmethod
+    def cluster(cls, request: pytest.FixtureRequest) -> Iterator[AbstractCluster | None]:
+        # This is for tests to work with spawn (Windows, requires this fixture) or Fork (ubuntu, macos)
+        if request.param is None:
+            yield None
+        else:
+            with ClusterGenerator("test", nb_workers=min(2, cpu_count())) as cluster:
+                yield cluster
+
+    def test_multiproc_config_rectangular_chunks(self) -> None:
+        """Accept positive rectangular chunks and reject invalid dimensions."""
+
+        # Copying the configuration should preserve both chunk dimensions
+        config = MultiprocConfig(chunks=(40, 25))
+
+        assert config.chunks == (40, 25)
+        assert config.copy().chunks == (40, 25)
+
+        # Validate values and types early before worker tasks are scheduled
+        with pytest.raises(ValueError, match="strictly positive"):
+            MultiprocConfig(chunks=(0, 25))
+        with pytest.raises(TypeError, match="integer or a tuple of two integers"):
+            MultiprocConfig(chunks=(40, 25.0))  # type: ignore
+
+    def test_multiproc_config__temporary_outputs(self, tmp_path: Path) -> None:
+        """
+        Checks that temporary configurations isolate and clean files without replacing the original worker cluster.
+        """
+
+        # Use a final output path separate from two intermediates needed by the same operation
+        config = MultiprocConfig(chunks=(4, 5), outfile=str(tmp_path / "final.tif"))
+        original = config.copy()
+        with pytest.raises(RuntimeError, match="operation failed"):
+            with config.temporary() as first, config.temporary() as second:
+                paths = [Path(first.outfile), Path(second.outfile)]
+                assert first.outfile != second.outfile
+                for temporary in (first, second):
+                    assert temporary.chunks == config.chunks
+                    assert temporary.driver == config.driver
+                    assert temporary.cluster is config.cluster
+
+                # Simulate a driver writing a main file and a sidecar before the enclosing operation fails
+                for path in paths:
+                    path.write_text("intermediate")
+                    path.with_suffix(".aux.xml").write_text("metadata")
+                raise RuntimeError("operation failed")
+
+        # Remove both complete directories and leave the original configuration and cluster usable
+        assert all(not path.parent.exists() for path in paths)
+        assert config.outfile == original.outfile
+        assert config.chunks == original.chunks
+        assert config.driver == original.driver
+        assert config.cluster is original.cluster
+        assert config.cluster.submit(abs, -3) == 3
+
+    def test_deprecated_map_names_preserve_signatures(self, tmp_path: Any) -> None:
+        """Forward the former top-level map functions with explicit deprecation warnings."""
+
+        raster = Raster.from_array(
+            np.arange(16, dtype=np.float32).reshape(4, 4),
+            transform=gu.Raster(self.aster_dem_path).transform,
+            crs=4326,
+        )
+        config = MultiprocConfig(chunks=2, outfile=str(tmp_path / "deprecated-map.tif"))
+
+        with pytest.warns(DeprecationWarning, match=r"Use map_overlap\(\) instead"):
+            mapped = map_overlap_multiproc_save(_custom_func, raster, config, 1, 2)
+        assert mapped.raster_equal(_custom_func(raster, 1, 2))
+
+        with pytest.warns(DeprecationWarning, match=r"Use map_collect\(\)"):
+            collected = map_multiproc_collect(_custom_func_stats, raster, config, return_tile=True)
+        assert len(collected) == 4
+        assert all(len(item) == 2 for item in collected)
 
     @pytest.mark.parametrize("example", [aster_dem_path, landsat_rgb_path])
     def test_load_raster_tile(self, example: str) -> None:
@@ -170,58 +294,59 @@ class TestMultiproc:
     @pytest.mark.parametrize("padding", [0, 1, 10])
     def test_remove_tile_padding(self, example: str, padding: int) -> None:
         """
-        Test removing padding from a raster tile after processing.
+        Checks that removing padding restores the destination block at raster edges and in its interior.
         """
         raster = Raster(example)
-        # Extract a tile with padding
+
+        # Expand an interior block whose row padding is clipped by the top raster edge
         tile = np.array([0, 100, 50, 150])
-        tile_pad = tile + np.array([-1, 1, -1, 1]) * padding
+        padded_tile = _add_tile_padding((raster.height, raster.width), tile, padding)
 
         raster_tile = _load_raster_tile(raster, tile)
-        raster_tile_with_padding = _load_raster_tile(raster, tile_pad)
+        raster_tile_with_padding = _load_raster_tile(raster, padded_tile)
 
-        # Remove padding and ensure it's back to the original size
+        # Remove the available padding and recover the exact destination data and grid
         _remove_tile_padding((raster.height, raster.width), raster_tile_with_padding, tile, padding)
         assert raster_tile_with_padding.raster_equal(raster_tile)
 
     @pytest.mark.parametrize("example", [aster_dem_path, landsat_rgb_path])
-    @pytest.mark.parametrize("padding", [0, 1, 3])
+    @pytest.mark.parametrize("padding", [0, 1, 6])
     def test_apply_func_block(self, example: str, padding: int) -> None:
         """
-        Test applying a function to a raster tile and handling padding removal.
+        Checks that a block function supports padding larger than half the destination block width.
         """
         raster = Raster(example)
         tile = np.array([10, 20, 10, 20])  # [rowmin, rowmax, colmin, colmax]
         size = 2
 
-        # Apply map_block
-        result_tile, _ = _apply_func_block(_custom_func_overlap, raster, tile, padding, size)
+        # Filter a 10 x 10 block using up to six neighboring pixels on each side
+        result_tile, result_bounds = _apply_func_block(_custom_func_overlap, raster, tile, padding, size)
 
+        # Compare the cropped worker result with the same block filtered as part of the full raster
         raster = _custom_func_overlap(raster, size)
-        # If padding >=1, The result should be the equal to the original tile filtered
         original_tile_filtered = _load_raster_tile(raster, tile)
         if padding >= size - 1:
             assert result_tile.raster_equal(original_tile_filtered)
         else:
             assert not result_tile.raster_equal(original_tile_filtered)
+        assert np.array_equal(result_bounds, tile)
 
     @pytest.mark.parametrize("example", [aster_dem_path, landsat_rgb_path])
     @pytest.mark.parametrize("tile_size", [100, 200])
-    @pytest.mark.parametrize("cluster", [None, cluster])
-    def test_map_overlap_multiproc_save(self, example: str, tile_size: int, cluster: None | AbstractCluster) -> None:
+    def test_map_overlap(self, example: str, tile_size: int, cluster: None | AbstractCluster) -> None:
         """
         Test the multiprocessing map function with a simple operation returning a raster.
         """
         raster = Raster(example)
         output_file = "output.tif"
         depth = 10
-        config = MultiprocConfig(tile_size, output_file, cluster=cluster)
+        config = MultiprocConfig(chunks=tile_size, outfile=output_file, cluster=cluster)
 
         addition = 5
         factor = 0.5
         # Apply the multiproc map function
 
-        output_raster = map_overlap_multiproc_save(_custom_func, raster, config, addition, factor, depth=depth)
+        output_raster = map_overlap(_custom_func, raster, config, addition, factor, depth=depth)
 
         # Ensure raster has not been loading during process
         assert not raster.is_loaded
@@ -242,31 +367,43 @@ class TestMultiproc:
 
         # With a tempfile :
         config = MultiprocConfig(tile_size)
-        output_raster = map_overlap_multiproc_save(_custom_func, raster, config, addition, factor, depth=depth)
+        output_raster = map_overlap(_custom_func, raster, config, addition, factor, depth=depth)
         output_raster_saved = Raster(config.outfile)
         assert output_raster_saved.raster_equal(output_raster)
 
         if raster.count == 1:
             # With a wrapper returning a Mask
-            output_mask = map_overlap_multiproc_save(_custom_func_mask, raster, config, depth=depth)
+            output_mask = map_overlap(_custom_func_mask, raster, config, depth=depth)
             assert np.array_equal(raster.get_mask(), output_mask.data)
 
+    def test_map_overlap_rectangular_chunks(self, tmp_path: Any) -> None:
+        """Map an overlapping function over unequal chunk dimensions without loading the source."""
+
+        # Write worker tiles to a dedicated test output
+        raster = Raster(self.aster_dem_path)
+        config = MultiprocConfig(chunks=(100, 160), outfile=str(tmp_path / "rectangular_overlap.tif"))
+
+        # Compare tiled execution with applying the same function to the full raster
+        output_raster = map_overlap(_custom_func, raster, config, addition=5, factor=0.5, depth=10)
+
+        assert not raster.is_loaded
+        assert output_raster.raster_equal(_custom_func(raster, addition=5, factor=0.5))
+
     @pytest.mark.parametrize("example", [aster_dem_path, landsat_rgb_path])
-    @pytest.mark.parametrize("tile_size", [10, 20])
-    @pytest.mark.parametrize("cluster", [None, cluster])
-    @pytest.mark.parametrize("return_tile", [False, True])
-    def test_map_multiproc_collect(
-        self, example: str, tile_size: int, cluster: None | AbstractCluster, return_tile: bool
+    @pytest.mark.parametrize("tile_size", [64, 100])
+    @pytest.mark.parametrize("return_block_info", [False, True])
+    def test_map_collect(
+        self, example: str, tile_size: int, cluster: None | AbstractCluster, return_block_info: bool
     ) -> None:
-        """
-        Test the multiprocessing map function with a simple operation returning not a raster.
-        """
+        """Checks that map_collect() statistics match the full raster without loading its source."""
+
+        # Open single-band and multiband files with multiple tiles and shorter edge tiles
         raster = Raster(example)
         config = MultiprocConfig(tile_size, cluster=cluster)
 
         # Apply the multiproc map function
-        results = map_multiproc_collect(_custom_func_stats, raster, config, return_tile=return_tile)  # type: ignore
-        if return_tile:
+        results = map_collect(_custom_func_stats, raster, config, return_block_info=return_block_info)  # type: ignore
+        if return_block_info:
             list_stats = [result[0] for result in results]
             list_tiles = [result[1] for result in results]
             assert np.array_equal(list_tiles[0], np.array([0, tile_size, 0, tile_size]))
@@ -283,3 +420,97 @@ class TestMultiproc:
         tiled_mean = np.nansum([stats["mean"] * stats["valid_count"] for stats in list_stats]) / tiled_count
         assert abs(total_stats["mean"] - tiled_mean) < tiled_mean * 1e-5
         assert total_stats["valid_count"] == tiled_count
+
+    def test_map_collect_rectangular_chunks(self) -> None:
+        """Collect block statistics correctly from unequal chunk dimensions."""
+
+        # Use narrow column chunks so the first reported window is unambiguous
+        raster = Raster(self.aster_dem_path)
+        config = MultiprocConfig(chunks=(10, 20))
+
+        # Retain block locations alongside each worker result
+        results = map_collect(_custom_func_stats, raster, config, return_block_info=True)  # type: ignore
+        list_stats = [result[0] for result in results]
+        list_tiles = [result[1] for result in results]
+
+        # Scheduling must preserve the requested rectangular shape and source laziness
+        assert np.array_equal(list_tiles[0], np.array([0, 10, 0, 20]))
+        assert not raster.is_loaded
+
+        # Recombine per-block counts and weighted means into full-raster statistics
+        total_stats = _custom_func_stats(raster)
+        tiled_count = np.nansum([stats["valid_count"] for stats in list_stats])
+        tiled_mean = np.nansum([stats["mean"] * stats["valid_count"] for stats in list_stats]) / tiled_count
+        assert abs(total_stats["mean"] - tiled_mean) < tiled_mean * 1e-5
+        assert total_stats["valid_count"] == tiled_count
+
+
+class TestMapOverlapChunked:
+    """Test module for map_overlap() loading behavior and exact equality with in-memory raster calculations."""
+
+    def test_map_overlap__depth_larger_than_half_chunk(self, tmp_path: Path) -> None:
+        """Checks that an overlap deeper than half a chunk gives the same result as the in-memory calculation."""
+
+        # Write a 9 x 11 raster so the final row and column chunks are shorter than the requested 4 x 5 chunks
+        values = np.arange(99, dtype=np.float32).reshape(9, 11)
+        transform = rio.transform.from_origin(500_000, 4_500_000, 10, 10)
+        source_file = tmp_path / "source.tif"
+        output_file = tmp_path / "filtered.tif"
+        Raster.from_array(values, transform, 32633).to_file(source_file)
+        source = Raster(source_file)
+
+        # Filter with three support pixels per side, exceeding half of both requested chunk dimensions
+        config = MultiprocConfig(chunks=(4, 5), outfile=str(output_file))
+        result = map_overlap(_custom_func_overlap, source, config, 3, depth=3)
+        expected = _custom_func_overlap(Raster(source_file), 3)
+
+        # Check file is unloaded and matches the in-memory result
+        assert not source.is_loaded
+        assert result.raster_equal(expected)
+
+    @pytest.mark.parametrize("source_bands, output_bands", [(1, 3), (3, 1)])
+    @pytest.mark.parametrize("execution_mode", ["basic", "multiprocessing"])
+    def test_map_overlap__changed_bands_and_metadata(
+        self, tmp_path: Path, source_bands: int, output_bands: int, execution_mode: str
+    ) -> None:
+        """
+        Checks that map_overlap() changes band count, returns the expected metadata and does not load the source.
+        """
+
+        # 1/ Write a small raster with uneven edge tiles and metadata distinct from the function's output
+        base = np.arange(99, dtype=np.float32).reshape(9, 11)
+        values = np.stack([base + index * 100 for index in range(source_bands)])
+        transform = rio.transform.from_origin(500_000, 4_500_000, 10, 10)
+        source_file = tmp_path / "source.tif"
+        output_file = tmp_path / "mapped.tif"
+        Raster.from_array(values, transform, 32633, area_or_point="Area", tags={"operation": "source"}).to_file(
+            source_file
+        )
+        source = Raster(source_file)
+        expected = _custom_func_bands(Raster(source_file), output_bands)
+
+        # 2/ Run synchronous and real process workers through the same shared block writer
+        with ClusterGenerator(execution_mode, nb_workers=1) as cluster:
+            config = MultiprocConfig(chunks=(4, 5), outfile=str(output_file), cluster=cluster)
+            result = map_overlap(_custom_func_bands, source, config, output_bands)
+        assert not source.is_loaded
+        assert not result.is_loaded
+
+        # Check metadata before reading data, including types preserved on the returned object
+        assert result.count == output_bands
+        assert result.area_or_point == "Point"
+        assert result.tags["operation"] == "band offsets"
+        assert result.tags["long_name"] == tuple(f"band_{index}" for index in range(output_bands))
+        assert (result.tags["worker_pid"] == os.getpid()) == (execution_mode == "basic")
+        assert result.raster_equal(expected)
+
+        # 3/ Verify every output band and inspect the actual file metadata independently of the returned Raster
+        expected = np.stack([base + index for index in range(output_bands)])
+        np.testing.assert_array_equal(result.data, expected.squeeze())
+        assert result.transform == transform
+        with rio.open(output_file) as dataset:
+            assert dataset.count == output_bands
+            assert dataset.tags()["AREA_OR_POINT"] == "Point"
+            assert dataset.tags()["operation"] == "band offsets"
+            assert dataset.nodata == -99999
+            np.testing.assert_array_equal(dataset.read(), expected)

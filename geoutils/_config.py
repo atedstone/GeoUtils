@@ -24,6 +24,8 @@ import configparser
 import os
 from typing import Any
 
+from rasterio.enums import Resampling
+
 # The setup is inspired by that of Matplotlib and Geowombat
 # https://github.com/matplotlib/matplotlib/blob/main/lib/matplotlib/rcsetup.py
 # https://github.com/jgrss/geowombat/blob/main/src/geowombat/config.py
@@ -45,10 +47,61 @@ def validate_bool(b: bool | str | int) -> bool:
         raise ValueError(f"Cannot convert {b!r} to bool")
 
 
+def validate_reprojection_method(reprojection_method: bool | str | int) -> str:
+    """Test reprojection_method"""
+    if isinstance(reprojection_method, str):
+        if reprojection_method.lower() in [method.name for method in Resampling]:
+            return reprojection_method.lower()
+    raise ValueError(
+        f"'{reprojection_method}' is not a valid rasterio.enums.Resampling method"
+        f"Valid methods: {[method.name for method in Resampling]}"
+    )
+
+
+def validate_interpolation_method(interpolation_method: bool | str | int) -> str:
+    """Test interpolation_method"""
+    valid_methods = ["nearest", "linear", "cubic", "quintic", "slinear", "pchip", "splinef2d"]
+    if isinstance(interpolation_method, str) and interpolation_method.lower() in valid_methods:
+        return interpolation_method.lower()
+    else:
+        raise ValueError(f"'{interpolation_method}' is not a valid interpolation methodValid methods: {valid_methods}")
+
+
+def validate_nodata_handling(nodata_handling: bool | str | int) -> str | int:
+    """Validate how interpolation handles missing source values."""
+    valid_choices = ["nearest", "ignore", "propagate", "half_order_up", "half_order_down"]
+    if isinstance(nodata_handling, str):
+        if nodata_handling.lower() in valid_choices:
+            return nodata_handling.lower()
+        try:
+            configured_distance = int(nodata_handling)
+        except ValueError:
+            configured_distance = -1
+        if configured_distance >= 0:
+            return configured_distance
+    elif not isinstance(nodata_handling, bool) and isinstance(nodata_handling, int) and nodata_handling >= 0:
+        return nodata_handling
+    raise ValueError(
+        f"'{nodata_handling}' is not a valid nodata_handling choice. Use {valid_choices} or a non-negative integer."
+    )
+
+
+def validate_pointcloud_return_type(value: Any) -> str:
+    """Validate the default representation of newly created point clouds."""
+    choices = ("dataarray", "dataset", "geodataframe")
+    if isinstance(value, str) and value.lower() in choices:
+        return value.lower()
+    raise ValueError(f"'{value}' is not a valid pointcloud_return_type. Use one of {choices}.")
+
+
 # Map the parameter names with a validating function to check user input
 _validators = {
     "shift_area_or_point": validate_bool,
     "warn_area_or_point": validate_bool,
+    "reprojection_method": validate_reprojection_method,
+    "interpolation_method": validate_interpolation_method,
+    "interpolation_nodata_handling": validate_nodata_handling,
+    "pointcloud_return_type": validate_pointcloud_return_type,
 }
 
 

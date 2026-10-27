@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import os
+import pathlib
 import re
 import tempfile
 import warnings
 from importlib.util import find_spec
+from pathlib import Path
 
 import geopandas as gpd
-import matplotlib.pyplot as plt
 import numpy as np
 import pytest
 from geopandas.testing import assert_geodataframe_equal
@@ -20,11 +21,20 @@ import geoutils as gu
 from geoutils import PointCloud
 from geoutils._typing import NDArrayNum
 
-DO_PLOT = False
+
+def _point_grid(size: int = 10) -> gpd.GeoDataFrame:
+    """Create a square point grid with one unique value per row."""
+
+    x = np.tile(np.arange(size), size)
+    y = np.repeat(np.arange(size), size)
+    return gpd.GeoDataFrame(
+        {"value": np.arange(size * size)},
+        geometry=gpd.points_from_xy(x, y),
+        crs=4326,
+    )
 
 
 class TestPointCloud:
-
     # 1/ Synthetic 2D points with main column and no auxiliary column
     rng = np.random.default_rng(42)
     arr_points = rng.integers(low=1, high=1000, size=(100, 3)) + rng.normal(0, 0.15, size=(100, 3))
@@ -69,18 +79,103 @@ class TestPointCloud:
         """Test instantiation of a point cloud."""
 
         # 1/ For a single column point cloud with 2D geometries
-        pc = PointCloud(self.gdf1, data_column="b1")
+        pc = PointCloud(self.gdf1, data_name="b1")
 
         # Assert that both the dataframe and data column name are equal
-        assert pc.data_column == "b1"
-        assert_geodataframe_equal(pc.ds, self.gdf1)
+        assert pc.data_name == "b1"
+        assert_geodataframe_equal(pc.gdf, self.gdf1)
 
         # 2/ For a point cloud with 3D geometries, no need to pass a data column
         pc = PointCloud(self.gdf3)
 
         # Assert that both the dataframe and data column name are equal
-        assert pc.data_column is None
-        assert_geodataframe_equal(pc.ds, self.gdf3)
+        assert pc.data_name is None
+        assert_geodataframe_equal(pc.gdf, self.gdf3)
+
+    def test_init_from_file__lazy(self) -> None:
+        """Check that non-LAS file-backed point clouds load data only when requested."""
+
+        # Write a non-LAS source whose metadata can be inspected independently
+        temp_dir = tempfile.TemporaryDirectory()
+        temp_file = os.path.join(temp_dir.name, "test.gpkg")
+        self.gdf1.to_file(temp_file)
+
+        # Construction records the source path without retaining the full dataframe
+        pc = PointCloud(temp_file, data_name="b1")
+
+        # CRS, bounds, rows and columns should remain available from file metadata
+        assert not pc.is_loaded
+        assert pc.data_name == "b1"
+        assert pc.crs == self.gdf1.crs
+        assert pc.bounds == gu.Vector(self.gdf1).bounds
+        assert pc.point_count == len(self.gdf1)
+        assert list(pc.columns) == list(self.gdf1.columns)
+        assert not pc.is_loaded
+
+        # Accessing point values triggers the first complete data load
+        assert np.array_equal(pc.data, self.gdf1["b1"].values)
+        assert pc.is_loaded
+
+    def test_init__downsample(self) -> None:
+        """Checks that a point cloud opening respects input downsampling."""
+
+        # Downsample a loaded dataframe by a factor of four
+        dataframe = _point_grid()
+        pointcloud = gu.PointCloud(dataframe, data_name="value", downsample=4)
+        expected = gu.PointCloud(dataframe, data_name="value").subsample(25, random_state=0)
+
+        # Exact equality check
+        assert pointcloud.point_count == 25
+        assert_geodataframe_equal(pointcloud.gdf.reset_index(drop=True), expected.gdf.reset_index(drop=True))
+
+    def test_init__downsample_lazy_file(self, tmp_path: Path) -> None:
+        """Checks that a file-backed point cloud loads its reduced row count."""
+
+        # Request downsampling and check file stays unloaded
+        filename = tmp_path / "points.gpkg"
+        _point_grid().to_file(filename, index=False)
+        pointcloud = gu.PointCloud(filename, data_name="value", downsample=4)
+        assert not pointcloud.is_loaded
+        assert pointcloud.point_count == 25
+
+        # Loading later applies the subsampling
+        pointcloud.load()
+        assert pointcloud.is_loaded
+        assert pointcloud.point_count == 25
+
+    @pytest.mark.parametrize("downsample", [0, -1, np.inf, "wrong"])
+    def test_open_pointcloud__error_downsample(self, downsample: object) -> None:
+        """Checks errors for downsampling user input."""
+
+        with pytest.raises((TypeError, ValueError), match="downsample must be"):
+            gu.PointCloud(_point_grid(2), data_name="value", downsample=downsample)  # type: ignore[arg-type]
+
+    def test_point_count__unknown_file_metadata_stays_unloaded(self, tmp_path: pathlib.Path) -> None:
+        """Checks that an unknown cached point count is read without loading point data."""
+
+        # Write a point file and simulate a driver that did not provide a cheap feature count during construction
+        filename = tmp_path / "points.gpkg"
+        self.gdf1.to_file(filename)
+        pointcloud = PointCloud(filename, data_name="b1")
+        pointcloud._nb_points = -1
+
+        # Force the driver to count features while keeping geometries and columns on disk
+        assert pointcloud.point_count == len(self.gdf1)
+        assert not pointcloud.is_loaded
+
+    def test_has_z__unloaded_3d_file(self) -> None:
+        """Checks that _has_z detects 3D file metadata without loading point geometries."""
+
+        # Write a point file with 3D geometry
+        with tempfile.TemporaryDirectory() as temp_dir:
+            filename = os.path.join(temp_dir, "points_3d.gpkg")
+            self.gdf3.to_file(filename)
+
+            # Read the geometry type from file metadata without loading the points
+            point_cloud = PointCloud(filename)
+
+            assert point_cloud._has_z
+            assert not point_cloud.is_loaded
 
     def test_init_las(self) -> None:
         # Import optional laspy or skip test
@@ -89,13 +184,13 @@ class TestPointCloud:
         # 1/ For a point cloud from LAS/LAZ file, no need to pass a data column to get the default Z
         pc = PointCloud(self.fn_las)
 
-        assert pc.data_column == "Z"
+        assert pc.data_name == "Z"
         assert not pc.is_loaded
 
         # 2/ But we can still specify another one
-        pc = PointCloud(self.fn_las, data_column="number_of_returns")
+        pc = PointCloud(self.fn_las, data_name="number_of_returns")
 
-        assert pc.data_column == "number_of_returns"
+        assert pc.data_name == "number_of_returns"
         assert not pc.is_loaded
 
     @pytest.mark.skipif(find_spec("laspy") is not None, reason="Only runs if laspy is missing.")
@@ -110,11 +205,11 @@ class TestPointCloud:
 
         # If the data column does not exist
         with pytest.raises(ValueError, match="Data column column_that_does_not_exist not found*"):
-            PointCloud(self.gdf1, data_column="column_that_does_not_exist")
+            PointCloud(self.gdf1, data_name="column_that_does_not_exist")
 
         # If vector is not only comprised of points
         with pytest.raises(ValueError, match="This vector file contains non-point geometries*"):
-            PointCloud(self.gdf4, data_column="z")
+            PointCloud(self.gdf4, data_name="z")
 
         # If the data column is not defined and the geometries are 2D
         with pytest.raises(ValueError, match="A data column name must be passed for a point cloud with 2D.*"):
@@ -155,7 +250,7 @@ class TestPointCloud:
         assert before_crs == after_crs
         assert before_bounds == after_bounds
         assert before_nb_points == after_nb_points
-        assert before_columns == after_columns
+        assert before_columns.equals(after_columns)
 
         # 2/ Check default column argument
         pc = PointCloud(self.fn_las)
@@ -188,6 +283,43 @@ class TestPointCloud:
         with pytest.raises(AttributeError, match="Cannot load as filename is not set anymore.*"):
             pc.load()
 
+    @pytest.mark.parametrize("inplace", [False, True])
+    @pytest.mark.parametrize("use_z", [False, True])
+    @pytest.mark.parametrize("convert_coords", [False, True])
+    def test_astype__convert_coords(self, inplace: bool, use_z: bool, convert_coords: bool) -> None:
+        """Checks that astype() converts coordinates properly."""
+
+        # We use coordinates and values for which "rounding" to float32 would be visible
+        x = np.array([1.123456789, 2.987654321])
+        y = np.array([3.123456789, 4.987654321])
+        values = np.array([5.123456789, 6.987654321])
+        columns: dict[str, list[int] | NDArrayNum] = {"quality": [10, 20]}
+        if not use_z:
+            columns["height"] = values
+        source = gpd.GeoDataFrame(columns, geometry=gpd.points_from_xy(x, y, z=values if use_z else None), crs=32631)
+        pointcloud = gu.PointCloud(source, data_name=None if use_z else "height")
+        original = pointcloud.gdf.copy()
+
+        # We run astype with coordinate conversion
+        converted = pointcloud.astype(np.float32, convert_coords=convert_coords, inplace=inplace)
+        output = pointcloud if inplace else converted
+
+        # We check converted values
+        if inplace:
+            assert converted is None
+        else:
+            assert isinstance(converted, gu.PointCloud)
+        assert output is not None
+        assert output.crs == pointcloud.crs
+        assert output.gdf["quality"].tolist() == [10, 20]
+        np.testing.assert_array_equal(output.data, values.astype(np.float32))
+        expected_x = x.astype(np.float32) if convert_coords else x
+        expected_y = y.astype(np.float32) if convert_coords else y
+        np.testing.assert_array_equal(output.geometry.x.to_numpy(), expected_x)
+        np.testing.assert_array_equal(output.geometry.y.to_numpy(), expected_y)
+        if not inplace:
+            assert_geodataframe_equal(pointcloud.gdf, original)
+
     def test_getitem_setitem(self) -> None:
         """Test the __getitem__ method ([]) for indexing and __setitem__ for index assignment."""
 
@@ -195,7 +327,7 @@ class TestPointCloud:
 
         # Open a point cloud
         # We need to do a deep copy to avoid modifying the original object
-        pc = PointCloud(self.gdf1.copy(deep=True), data_column="b1")
+        pc = PointCloud(self.gdf1.copy(deep=True), data_name="b1")
         pc_orig = pc.copy()
 
         # Create a boolean array of the same shape, and a mask of the same transform/crs
@@ -253,56 +385,51 @@ class TestPointCloud:
         with pytest.raises(ValueError, match=re.escape(message_pc.format(op_name_index))):
             pc[mask]
 
-    def test_data_column(self) -> None:
-        """Test the setting and getting of the main data column."""
+    def test_data_name(self) -> None:
+        """Checks that named columns and geometry Z can be selected as point values."""
 
-        # Assert column is set properly at instantiation
-        pc = PointCloud(self.gdf1, data_column="b1")
-        assert pc.data_column == "b1"
+        # Select b1 when making a 2D point cloud and return its values through PointCloud.data
+        pc = PointCloud(self.gdf1, data_name="b1")
+        assert pc.data_name == "b1"
         assert np.array_equal(pc.data, self.gdf1["b1"].values)
 
-        # And can be reset to another name if it exists
-        pc2 = PointCloud(self.gdf2, data_column="b1")
-        assert pc2.data_column == "b1"
+        # Change a second point cloud from b1 to b2 through the property, then back through set_data_name()
+        pc2 = PointCloud(self.gdf2, data_name="b1")
+        assert pc2.data_name == "b1"
         assert np.array_equal(pc2.data, self.gdf2["b1"].values)
-
-        # First syntax
-        pc2.data_column = "b2"
-        assert pc2.data_column == "b2"
+        pc2.data_name = "b2"
+        assert pc2.data_name == "b2"
         assert np.array_equal(pc2.data, self.gdf2["b2"].values)
-
-        # Equivalent syntax
-        pc2.set_data_column("b1")
-        assert pc2.data_column == "b1"
+        pc2.set_data_name("b1")
+        assert pc2.data_name == "b1"
         assert np.array_equal(pc2.data, self.gdf2["b1"].values)
 
-        # Assert no data column is set for 3D points, using the Z coordinates instead
+        # Leave the data column unset for 3D points, which makes geometry Z the active values
         pc3 = PointCloud(self.gdf3)
-        assert pc3.data_column is None
+        assert pc3.data_name is None
         assert np.array_equal(pc3.data, self.gdf3.geometry.z.values)
 
-    def test_data_column__errors(self) -> None:
-        """Test errors raised during setting of data column."""
+        # A named column can be selected for 3D points without changing their geometry heights
+        pc4 = PointCloud(self.gdf32, data_name="b2")
+        assert pc4.data_name == "b2"
+        assert np.array_equal(pc4.data, self.gdf32["b2"].values)
+        assert np.array_equal(pc4.geometry.z, self.gdf32.geometry.z)
 
-        pc = PointCloud(self.gdf1, data_column="b1")
-        # If the data column does not exist
-        with pytest.raises(ValueError, match="Data column column_that_does_not_exist not found*"):
-            pc.data_column = "column_that_does_not_exist"
-        # Equivalent syntax
-        with pytest.raises(ValueError, match="Data column column_that_does_not_exist not found*"):
-            pc.set_data_column("column_that_does_not_exist")
+    def test_data_name__errors(self) -> None:
+        """Checks that both ways of selecting a data column reject a missing name."""
 
-        # If a data column name is passed for 3D points
-        with pytest.warns(UserWarning, match="Overriding 3D points with*"):
-            pc4 = PointCloud(self.gdf32, data_column="b2")
-            assert pc4.data_column == "b2"
-            assert np.array_equal(pc4.data, self.gdf32["b2"].values)
+        # Try the property and set_data_name() with a name that is not present in the dataframe
+        pc = PointCloud(self.gdf1, data_name="b1")
+        with pytest.raises(ValueError, match="Data column column_that_does_not_exist not found*"):
+            pc.data_name = "column_that_does_not_exist"
+        with pytest.raises(ValueError, match="Data column column_that_does_not_exist not found*"):
+            pc.set_data_name("column_that_does_not_exist")
 
     def test_data(self) -> None:
         """Test the setting and getting of the main data, depending on input geometry."""
 
         # For a point cloud using 2D geometries + a main data column
-        pc = PointCloud(self.gdf1, data_column="b1")
+        pc = PointCloud(self.gdf1, data_name="b1")
         assert np.array_equal(pc.data, self.gdf1["b1"].values)
         pc += 1
         assert np.array_equal(pc.data, self.gdf1["b1"].values + 1)
@@ -317,12 +444,12 @@ class TestPointCloud:
         """Test building point cloud from array."""
 
         # Build from array and compare
-        pc1 = PointCloud(self.gdf1, data_column="b1")
-        pc_from_arr = PointCloud.from_array(self.arr_points, crs=4326, data_column="b1")
+        pc1 = PointCloud(self.gdf1, data_name="b1")
+        pc_from_arr = PointCloud.from_array(self.arr_points, crs=4326, data_name="b1")
         assert pc_from_arr.pointcloud_equal(pc1)
 
         # Should be the same with transposed array
-        pc_from_arr = PointCloud.from_array(self.arr_points.T, crs=4326, data_column="b1")
+        pc_from_arr = PointCloud.from_array(self.arr_points.T, crs=4326, data_name="b1")
         assert pc_from_arr.pointcloud_equal(pc1)
 
     def test_from_array__errors(self) -> None:
@@ -335,18 +462,18 @@ class TestPointCloud:
     def test_from_tuples(self) -> None:
         """Test building point cloud from list of tuples."""
 
-        pc1 = PointCloud(self.gdf1, data_column="b1")
+        pc1 = PointCloud(self.gdf1, data_name="b1")
         tuples_xyz = list(zip(self.arr_points[:, 0], self.arr_points[:, 1], self.arr_points[:, 2]))
-        pc_from_tuples = PointCloud.from_tuples(tuples_xyz=tuples_xyz, crs=4326, data_column="b1")
+        pc_from_tuples = PointCloud.from_tuples(tuples_xyz=tuples_xyz, crs=4326, data_name="b1")
         assert pc_from_tuples.pointcloud_equal(pc1)
 
     def test_from_xyz(self) -> None:
         """Test building point cloud from xyz array-like."""
 
         # Build from array and compare
-        pc1 = PointCloud(self.gdf1, data_column="b1")
+        pc1 = PointCloud(self.gdf1, data_name="b1")
         pc_from_xyz = PointCloud.from_xyz(
-            x=self.arr_points[:, 0], y=self.arr_points[:, 1], z=self.arr_points[:, 2], crs=4326, data_column="b1"
+            x=self.arr_points[:, 0], y=self.arr_points[:, 1], z=self.arr_points[:, 2], crs=4326, data_name="b1"
         )
         assert pc_from_xyz.pointcloud_equal(pc1)
 
@@ -356,7 +483,7 @@ class TestPointCloud:
             y=list(self.arr_points[:, 1]),
             z=list(self.arr_points[:, 2]),
             crs=4326,
-            data_column="b1",
+            data_name="b1",
         )
         assert pc_from_xyz.pointcloud_equal(pc1)
 
@@ -366,7 +493,7 @@ class TestPointCloud:
             y=tuple(self.arr_points[:, 1]),
             z=tuple(self.arr_points[:, 2]),
             crs=4326,
-            data_column="b1",
+            data_name="b1",
         )
         assert pc_from_xyz.pointcloud_equal(pc1)
 
@@ -381,7 +508,7 @@ class TestPointCloud:
         """Test exporting point cloud to array."""
 
         # Convert point cloud and compare
-        pc1 = PointCloud(self.gdf1, data_column="b1")
+        pc1 = PointCloud(self.gdf1, data_name="b1")
         arr_from_pc = pc1.to_array()
         assert np.array_equal(arr_from_pc, self.arr_points.T)
 
@@ -389,7 +516,7 @@ class TestPointCloud:
         """Test exporting point cloud to tuples."""
 
         # Convert point cloud and compare
-        pc1 = PointCloud(self.gdf1, data_column="b1")
+        pc1 = PointCloud(self.gdf1, data_name="b1")
         tuples_xyz = list(zip(self.arr_points[:, 0], self.arr_points[:, 1], self.arr_points[:, 2]))
         tuples_from_pc = pc1.to_tuples()
         assert tuples_from_pc == tuples_xyz
@@ -398,7 +525,7 @@ class TestPointCloud:
         """Test exporting point cloud to xyz arrays."""
 
         # Convert point cloud and compare
-        pc1 = PointCloud(self.gdf1, data_column="b1")
+        pc1 = PointCloud(self.gdf1, data_name="b1")
         xyz_from_pc = pc1.to_xyz()
         assert np.array_equal(np.stack(xyz_from_pc), self.arr_points.T)
 
@@ -425,7 +552,7 @@ class TestPointCloud:
         pytest.importorskip("laspy")
 
         # 1/ For a X/Y/Z point cloud with no auxiliary data
-        pc1 = PointCloud(self.gdf1, data_column="b1")
+        pc1 = PointCloud(self.gdf1, data_name="b1")
 
         # Temporary folder
         temp_dir = tempfile.TemporaryDirectory()
@@ -442,7 +569,7 @@ class TestPointCloud:
         assert np.allclose(pc1.data, saved1.data, atol=atol)
 
         # 2/ For a X/Y/Z point cloud with some auxiliary data
-        pc2 = PointCloud(self.gdf2, data_column="b1")
+        pc2 = PointCloud(self.gdf2, data_name="b1")
 
         # Save file to temporary file, with defaults opts
         temp_file = os.path.join(temp_dir.name, "test2.las")
@@ -469,7 +596,7 @@ class TestPointCloud:
     def test_cast_vector_methods__geometry_invariant(self, method: str) -> None:
         """Test that method that don't modify geometry do cast back to a PointCloud."""
 
-        pc1 = PointCloud(self.gdf1, data_column="b1")
+        pc1 = PointCloud(self.gdf1, data_name="b1")
 
         getattr(pc1, method)(**self.specific_method_args[method])
         assert isinstance(pc1, PointCloud)
@@ -525,6 +652,32 @@ class TestArithmetic:
     pc1_wrong_shape = gu.PointCloud.from_array(arr_wrong_shape, crs=crs)
 
     pc1_wrong_coords = gu.PointCloud.from_array(arr_wrong_coord, crs=crs)
+
+    def test_info(self) -> None:
+        """Test that the information summary is consistent"""
+        path = gu.examples.get_path_test("everest_landsat_b4")
+        raster = gu.Raster(path)
+        pc = raster.to_pointcloud()
+
+        # Check default runs without error (prints to screen)
+        output = pc.info()
+        assert output is None
+
+        # Otherwise returns info
+        output2 = pc.info(verbose=False)
+        assert isinstance(output2, str)
+        list_prints = ["Filename", "Coordinate system", "Extent", "Number of features", "Attributes"]
+        assert all(p in output2 for p in list_prints)
+
+        # Test stats param (raster vs pc)
+        pc_with_stats_split = pc.info(stats=True, verbose=False).split("\n")
+        start_stats_pc = pc_with_stats_split.index("Statistics:")
+        raster_with_stats_split = raster.info(stats=True, verbose=False).split("\n")
+        start_stats_raster = raster_with_stats_split.index("Statistics:")
+
+        pc_stats_split = pc_with_stats_split[start_stats_pc:]
+        raster_stats_split = raster_with_stats_split[start_stats_raster:]
+        assert pc_stats_split == raster_stats_split
 
     def test_pointcloud_equal(self) -> None:
         """
@@ -650,8 +803,9 @@ class TestArithmetic:
 
         # Test with zeros values (e.g. division)
         pc1 = self.pc1
-        pc3 = getattr(pc1, op)(pc2_zero)
-        assert np.all(pc3.data == getattr(pc1.data, op)(pc2_zero.data))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pc3 = getattr(pc1, op)(pc2_zero)
+            assert np.all(pc3.data == getattr(pc1.data, op)(pc2_zero.data))
 
         # Test with a numpy array
         pc1 = self.pc1_f32
@@ -985,62 +1139,6 @@ class TestArithmetic:
 
         assert isinstance(pc, gu.PointCloud)
         assert np.median(pc) == 26.0
-
-    def test_plot(self) -> None:
-        """Test the pointcloud plot."""
-
-        # Create a dummy array of unique values and the associated coordinates
-        array = np.arange(25, dtype=int)
-        coords_x = [i for _ in range(5) for i in range(5)]
-        coords_y = [i for i in range(5) for _ in range(5)]
-
-        # Create the corresponding pointcloud
-        pc = gu.PointCloud.from_xyz(x=coords_x, y=coords_y, z=array, crs=4326)
-
-        # Test default plot
-        pc.plot()
-        if DO_PLOT:
-            plt.show()
-        else:
-            plt.close()
-        assert True
-
-        # Test with new figure
-        plt.figure()
-        pc.plot()
-        if DO_PLOT:
-            plt.show()
-        else:
-            plt.close()
-        assert True
-
-        # Test with provided ax
-        ax = plt.subplot(111)
-        pc.plot(ax=ax)
-        if DO_PLOT:
-            plt.show()
-        else:
-            plt.close()
-        assert True
-
-        # Test vmin, vmax and cbar_title
-        ax = plt.subplot(111)
-        pc.plot(cmap="gray", vmin=0, vmax=20, cbar_title="Custom cbar", ax=ax)
-        if DO_PLOT:
-            plt.show()
-        else:
-            plt.close()
-        assert True
-
-        # Test save fig
-        temp_dir = tempfile.TemporaryDirectory()
-        temp_file = os.path.join(temp_dir.name, "test.png")
-        pc.plot(savefig_fname=temp_file)
-        if DO_PLOT:
-            plt.show()
-        else:
-            plt.close()
-        assert os.path.isfile(temp_file)
 
 
 class TestArrayInterface:
@@ -1403,9 +1501,7 @@ class TestArrayInterface:
         # assert np.ma.allequal(outputs_ma[0], outputs_pc[0].data) and np.ma.allequal(
         #             outputs_ma[1], outputs_pc[1].data)
 
-    @pytest.mark.parametrize(
-        "np_func_name", ufuncs_str_2nin_1nout + ufuncs_str_2nin_2nout + handled_functions_2in
-    )  # type: ignore
+    @pytest.mark.parametrize("np_func_name", ufuncs_str_2nin_1nout + ufuncs_str_2nin_2nout + handled_functions_2in)  # type: ignore
     def test_raise_errors_2nin(self, np_func_name: str) -> None:
         """Check that proper errors are raised when input pointcloud/array don't match (only 2-input functions)."""
 
@@ -1421,7 +1517,6 @@ class TestArrayInterface:
         # Strange errors happening only for these 4 functions...
         # See issue #457
         if np_func_name not in ["allclose", "isclose", "array_equal", "array_equiv"]:
-
             # Point clouds with different CRS or shape
             # Different shape
             georef_twopc_message = (

@@ -1,4 +1,4 @@
-# This workflow will upload a Python Package when a release is created
+# This workflow will upload a Python Package when a new GitHub release is created
 # See reference: https://packaging.python.org/en/latest/guides/publishing-package-distribution-releases-using-github-actions-ci-cd-workflows/
 
 name: Publish to PyPI
@@ -19,20 +19,19 @@ jobs:
     name: Build distribution
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
       with:
         fetch-depth: 0
         persist-credentials: false
     - name: Set up Python
-      uses: actions/setup-python@v6
+      uses: actions/setup-python@v7
       with:
         python-version: '3.12'
-    - name: Install pypa/build
-      run: python3 -m pip install build --user
+    - uses: astral-sh/setup-uv@v10.3.2
     - name: Build a binary wheel and a source tarball
-      run: python3 -m build
+      run: uv build
     - name: Store the distribution packages
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@v7
       with:
         name: python-package-distributions
         path: dist/
@@ -51,7 +50,7 @@ jobs:
 
     steps:
       - name: Download all the dists
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: python-package-distributions
           path: dist/

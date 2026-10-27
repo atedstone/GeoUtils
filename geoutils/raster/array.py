@@ -1,4 +1,4 @@
-# Copyright (c) 2025 GeoUtils developers
+# Copyright (c) 2026 GeoUtils developers
 #
 # This file is part of the GeoUtils project:
 # https://github.com/glaciohack/geoutils
@@ -21,15 +21,103 @@
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import xarray as xr
 
-from geoutils._dispatch import has_geo_attr
+from geoutils._dispatch import get_geo_attr, has_geo_attr
 from geoutils._typing import MArrayNum, NDArrayBool, NDArrayNum
 
 if TYPE_CHECKING:
-    from geoutils.raster.base import RasterType
+    from geoutils.raster.base import RasterLike, RasterType
+
+
+#################################
+# 1/ INTERNAL ARRAY NORMALIZATION
+#################################
+
+
+def _selected_raster_data(raster: Any, band: int = 1, *, fill_value: float | bool = np.nan) -> Any:
+    """Select one raster band without loading lazy data."""
+
+    # Unwrap Xarray while preserving the laziness of its underlying array
+    data = get_geo_attr(raster, "data")
+    if isinstance(data, xr.DataArray):
+        data = data.data
+
+    # Validate the public one based index before selecting one data plane
+    if band < 1:
+        raise ValueError("band numbers start at 1.")
+    if data.ndim == 2:
+        if band != 1:
+            raise ValueError("A single band raster only accepts band=1.")
+        selected = data
+    elif data.ndim == 3:
+        if band > data.shape[0]:
+            raise ValueError("band exceeds the number of raster bands.")
+        selected = data[band - 1]
+    else:
+        raise ValueError("Raster values must have two spatial dimensions and an optional band dimension.")
+
+    # Preserve unmasked integer data and promote only when missing values require NaN
+    if np.ma.isMaskedArray(selected):
+        if not np.ma.is_masked(selected):
+            return np.ma.getdata(selected)
+        if np.isnan(fill_value):
+            selected = selected.astype(np.result_type(selected.dtype, np.float32))
+        selected = selected.filled(fill_value)
+    return selected
+
+
+def _masked_raster_data(source_raster: RasterLike) -> MArrayNum:
+    """Return raster values and their mask as an in-memory masked array."""
+
+    data = source_raster.data
+    if isinstance(data, xr.DataArray):
+        array = data.to_masked_array(copy=True)
+    else:
+        array = np.ma.array(data, copy=True)
+
+    # Combine masked, non-finite and explicit nodata representations across both raster classes
+    invalid = np.ma.getmaskarray(array) | ~np.isfinite(array.data)
+    nodata = getattr(source_raster, "nodata", None)
+    xarray_obj = getattr(source_raster, "_obj", None)
+    decoded = xarray_obj is not None and xarray_obj.encoding.get("_FillValue") is not None
+    if nodata is not None and not decoded:
+        invalid |= array.data == nodata
+    return np.ma.array(array.data, mask=invalid, copy=False)
+
+
+def _processing_mask(mask: RasterLike | NDArrayBool | None, shape: tuple[int, ...]) -> NDArrayBool:
+    """Return a Boolean processing mask matching one raster band."""
+
+    if mask is None:
+        return np.ones(shape[-2:], dtype=bool)
+
+    # Raster masks may have a singleton band dimension that has no spatial meaning
+    mask_data: Any = mask.data if hasattr(mask, "data") and not isinstance(mask, np.ndarray) else mask
+    if isinstance(mask_data, xr.DataArray):
+        mask_data = mask_data.to_numpy()
+    mask_array = np.asarray(mask_data).squeeze()
+    if mask_array.shape != shape[-2:]:
+        raise ValueError(f"Mask shape {mask_array.shape} does not match raster shape {shape[-2:]}.")
+    return mask_array.astype(bool)
+
+
+def _as_bands(array: MArrayNum) -> tuple[MArrayNum, bool]:
+    """Expose two-dimensional and multiband arrays through one band dimension."""
+
+    if array.ndim == 2:
+        return array[np.newaxis, ...], True
+    if array.ndim == 3:
+        return array, False
+    raise ValueError("Raster processing expects a two-dimensional or multiband array.")
+
+
+##############################
+# 2/ MASK AND EXTENT FUNCTIONS
+##############################
 
 
 def get_mask_from_array(array: NDArrayNum | NDArrayBool | MArrayNum) -> NDArrayBool:
@@ -40,7 +128,14 @@ def get_mask_from_array(array: NDArrayNum | NDArrayBool | MArrayNum) -> NDArrayB
 
     :returns invalid_mask: boolean array, True where array is masked or Nan.
     """
-    mask = (array.mask | ~np.isfinite(array.data)) if isinstance(array, np.ma.masked_array) else ~np.isfinite(array)
+    masked = np.ma.isMaskedArray(array)
+    values = np.ma.getdata(array) if masked else array
+    if values.dtype.kind == "O":
+        # Check nullable numeric objects without changing the stored integer values or sampled IDs
+        values = values.astype(np.float64)
+    mask = ~np.isfinite(values)
+    if masked:
+        mask |= np.ma.getmaskarray(array)
     return mask.squeeze()
 
 
@@ -65,7 +160,7 @@ def get_array_and_mask(
     if check_shape:
         if array.ndim > 2 and array.shape[0] > 1:
             raise ValueError(
-                f"Invalid array shape given: {array.shape}." "Expected 2D array or 3D array where arr.shape[0] == 1"
+                f"Invalid array shape given: {array.shape}.Expected 2D array or 3D array where arr.shape[0] == 1"
             )
 
     # If an occupied mask exists and a view was requested, trigger a warning.
@@ -100,6 +195,11 @@ def get_valid_extent(array: NDArrayNum | NDArrayBool | MArrayNum) -> tuple[int, 
     cols_nonzero = np.where(np.count_nonzero(valid_mask, axis=0) > 0)[0]
     rows_nonzero = np.where(np.count_nonzero(valid_mask, axis=1) > 0)[0]
     return rows_nonzero[0], rows_nonzero[-1], cols_nonzero[0], cols_nonzero[-1]
+
+
+###########################
+# 3/ COORDINATE TRANSFORMS
+###########################
 
 
 def get_xy_rotated(raster: RasterType, along_track_angle: float) -> tuple[NDArrayNum, NDArrayNum]:

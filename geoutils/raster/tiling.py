@@ -1,4 +1,4 @@
-# Copyright (c) 2025 GeoUtils developers
+# Copyright (c) 2026 GeoUtils developers
 #
 # This file is part of the GeoUtils project:
 # https://github.com/glaciohack/geoutils
@@ -17,6 +17,7 @@
 # limitations under the License.
 
 """Tiling tools for arrays and rasters."""
+
 from __future__ import annotations
 
 import sys

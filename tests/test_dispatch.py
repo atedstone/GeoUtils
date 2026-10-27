@@ -2,6 +2,7 @@
 Test the dispatch functions used for checking and normalizing inputs.
 """
 
+from types import SimpleNamespace
 from typing import Any
 
 import geopandas as gpd
@@ -13,19 +14,21 @@ import rasterio as rio
 from shapely.geometry import Point, Polygon
 
 import geoutils as gu
-from geoutils._dispatch import _check_coords  # Level-0 checks (manual input)
-from geoutils._dispatch import _grid_from_src  # Helpers for grid conversion
 from geoutils._dispatch import (  # Level-1 checks (match reference object)
     _check_bounds,
+    _check_coords,  # Level-0 checks (manual input)
     _check_crs,
     _check_match_bbox,
     _check_match_grid,
     _check_match_points,
     _check_resolution,
     _check_shape,
+    _clip_geodataframe,
     _grid_from_bounds_res,
     _grid_from_bounds_shape,
     _grid_from_coords,
+    _grid_from_src,  # Helpers for grid conversion
+    get_geo_interface,
 )
 from geoutils.exceptions import (
     IgnoredGridWarning,
@@ -36,6 +39,52 @@ from geoutils.exceptions import (
     InvalidResolutionError,
     InvalidShapeError,
 )
+
+
+class TestGeoInterface:
+    """Test module for spatial metadata shared by an object or accessor and its geospatial operations."""
+
+    @pytest.mark.parametrize("representation", ["raster", "accessor", "dataarray"])
+    def test_get_geo_interface__raster_metadata(self, representation: str) -> None:
+        """Checks that raster band count and spatial shape stay distinct from native Xarray methods and dimensions."""
+
+        # Include two bands so native Xarray shape differs from the two-dimensional raster grid
+        raster = gu.Raster.from_array(np.ones((2, 3, 4)), rio.transform.from_origin(0, 3, 1, 1), crs=32633)
+        array = raster.to_xarray()
+        source = {"raster": raster, "accessor": array.rst, "dataarray": array}[representation]
+
+        # Resolve one interface and read both metadata fields from it
+        interface = get_geo_interface(source, "ij2xy", accessors=("rst",))
+        assert interface.count == 2
+        assert interface.shape == (3, 4)
+        assert interface.transform == raster.transform
+
+        # Plain arrays have no spatial interface and cannot supply a reference grid
+        assert get_geo_interface(np.ones((3, 4)), "ij2xy", accessors=("rst",)) is None
+
+
+class TestClipGeometry:
+    """Test module for preserving clipping features and matching their coordinate reference system."""
+
+    def test_clip_geodataframe__keeps_features_in_target_crs(self) -> None:
+        """Checks that clipping normalization reprojects features without dissolving them."""
+
+        # Create two disconnected polygons whose separate rows can later be assigned to different raster chunks
+        source = gpd.GeoDataFrame(
+            geometry=[
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 1)]),
+                Polygon([(2, 2), (3, 2), (3, 3), (2, 3)]),
+            ],
+            crs=4326,
+        )
+
+        # Normalize the mask to a different target CRS through the same helper used by raster clip()
+        normalized = _clip_geodataframe(source, target_crs=rio.crs.CRS.from_epsg(3857))
+
+        # Both rows remain available for spatial partitioning and their coordinates match an independent reprojection
+        assert len(normalized) == 2
+        assert normalized.crs == "EPSG:3857"
+        gpd.testing.assert_geodataframe_equal(normalized, source.to_crs(3857))
 
 
 class TestDispatchLevelZero:
@@ -366,7 +415,7 @@ class TestDispatchLevelOne:
     vect2 = gu.Vector(gpd.GeoDataFrame({"geometry": [Polygon([(0, 0), (2, 0), (2, 2), (0, 2)])]}, crs="EPSG:4326"))
     # Xarray DataArray and Vector geodataframe
     rast_xr = rast.to_xarray()
-    vect_gdf = vect.ds
+    vect_gdf = vect.gdf
 
     @pytest.mark.parametrize(
         "bbox_input, expected",
@@ -382,6 +431,10 @@ class TestDispatchLevelOne:
             # Vector-like objects
             (vect, (0, 0, 1, 1)),
             (vect_gdf, (0, 0, 1, 1)),
+            # Third-party object using the common bbox name without a bounds alias
+            (SimpleNamespace(bbox=(2, 3, 4, 5), crs=pyproj.CRS.from_epsg(4326)), (2, 3, 4, 5)),
+            # Third-party object retaining the previous bounds name
+            (SimpleNamespace(bounds=(3, 4, 5, 6), crs=pyproj.CRS.from_epsg(4326)), (3, 4, 5, 6)),
         ],
     )
     def test_check_match_bbox__valid(self, bbox_input: Any, expected: Any) -> None:
@@ -449,8 +502,8 @@ class TestDispatchLevelOne:
 
         # For vector-like input
         if isinstance(points_input, gu.Vector):
-            assert pts[0].shape[0] == len(points_input.ds)  # type: ignore
-            assert pts[1].shape[0] == len(points_input.ds)  # type: ignore
+            assert pts[0].shape[0] == len(points_input.gdf)  # type: ignore
+            assert pts[1].shape[0] == len(points_input.gdf)  # type: ignore
 
     @pytest.mark.parametrize(
         "points_input, match_text",
@@ -497,6 +550,8 @@ class TestDispatchLevelOne:
             ("rast", "vect", 1, None, None, None),
             # Reference vector + shape
             ("rast", "vect", None, (3, 3), None, None),
+            # Reference object exposing only bbox and CRS + resolution
+            ("rast", "bbox", 1, None, None, None),
             # 2/ Second category: Source fallback (= first column matters)
             # Source fallback for bounds (raster or vector) + resolution
             ("rast", None, 1, None, None, None),
@@ -518,6 +573,8 @@ class TestDispatchLevelOne:
             ref_input = rast
         elif ref == "vect":
             ref_input = vect
+        elif ref == "bbox":
+            ref_input = SimpleNamespace(bbox=(0, 0, 1, 1), crs=pyproj.CRS.from_epsg(4326))
 
         if src == "rast":
             src_input = rast
@@ -532,6 +589,8 @@ class TestDispatchLevelOne:
         assert out_crs == src_input.crs
         assert isinstance(out_shape, tuple) and len(out_shape) == 2
         assert isinstance(out_transform, rio.Affine)
+        if ref == "bbox":
+            assert rio.transform.array_bounds(*out_shape, out_transform) == pytest.approx((0, 0, 1, 1))
 
     @pytest.mark.parametrize(
         "kwargs, error_match, warn",

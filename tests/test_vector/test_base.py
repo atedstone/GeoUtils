@@ -1,0 +1,462 @@
+"""Test VectorBase class, parent of Vector class and 'vct' Pandas accessor."""
+
+from __future__ import annotations
+
+import warnings
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError
+
+import geopandas as gpd
+import numpy as np
+import pyogrio
+import pytest
+import rasterio as rio
+import xarray as xr
+from geopandas.testing import assert_geodataframe_equal
+from pyproj import CRS
+from pyproj.crs import CompoundCRS
+from shapely import Polygon
+from shapely.geometry import box
+
+import geoutils as gu
+from geoutils import PointCloud, Raster, Vector
+from geoutils._dispatch import is_dask_dataframe
+from geoutils.vector.base import VectorBase
+from geoutils.vector.pd_accessor import GeoDataFrameVectorAccessor
+from tests.accessor_helpers import assert_output_equal
+from tests.remote_helpers import RemoteFiles
+
+
+class NeedsTestError(ValueError):
+    """Error to remember to add test when a new VectorBase method is added."""
+
+
+class TestVectorNames:
+    """Test module for native GeoDataFrame storage and deprecated ds forwarding."""
+
+    @pytest.mark.parametrize("as_pointcloud", [False, True])
+    def test_gdf__deprecated_storage(self, as_pointcloud: bool) -> None:
+        """Checks that ds warns once on reading or assigning the same GeoDataFrame exposed by gdf."""
+
+        # PointCloud inherits the native Vector storage alias
+        frame = gpd.GeoDataFrame({"height": [2.0, 3.0]}, geometry=gpd.points_from_xy([0.0, 1.0], [0.0, 1.0]), crs=32633)
+        vector = PointCloud(frame, data_name="height") if as_pointcloud else Vector(frame)
+
+        # Both getters refer to the same dataframe, and the old setter updates cached spatial metadata
+        with pytest.warns(DeprecationWarning, match="ds.*gdf") as recorded:
+            assert vector.ds is vector.gdf is frame
+        assert len(recorded) == 1
+        replacement = frame.to_crs(4326)
+        with pytest.warns(DeprecationWarning, match="ds.*gdf"):
+            vector.ds = replacement
+        assert vector.gdf is replacement
+        assert vector.crs == replacement.crs
+        assert vector.columns.equals(replacement.columns)
+
+    @pytest.mark.parametrize("as_pointcloud", [False, True])
+    def test_gdf__deferred_loading(self, tmp_path: Any, as_pointcloud: bool) -> None:
+        """Checks that gdf loads deferred native data without warnings and ds forwards to the loaded frame."""
+
+        # Opening a filename reads metadata while leaving geometries and values unloaded
+        frame = gpd.GeoDataFrame({"height": [2.0, 3.0]}, geometry=gpd.points_from_xy([0.0, 1.0], [0.0, 1.0]), crs=32633)
+        filename = tmp_path / "points.gpkg"
+        frame.to_file(filename)
+        vector = PointCloud(filename, data_name="height") if as_pointcloud else Vector(filename)
+        assert not vector.is_loaded
+
+        # The new property loads data; copying and spatial operations use it without deprecated calls
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            loaded = vector.gdf
+            copied = vector.copy()
+            projected = vector.reproject(crs=4326)
+        assert vector.is_loaded
+        assert_geodataframe_equal(loaded, frame)
+        assert copied.gdf is not loaded
+        assert projected.crs == CRS.from_epsg(4326)
+        with pytest.warns(DeprecationWarning, match="ds.*gdf"):
+            assert vector.ds is loaded
+
+
+class TestClassVsAccessorConsistency:
+    """
+    Test class to check the consistency between the outputs of the Vector class and Pandas accessor.
+
+    All shared attributes should be the same, except for the filename which is not kept by the Pandas accessor.
+    """
+
+    poly1 = Polygon([(0, 0), (2, 0), (2, 2), (0, 2)])
+    poly2 = Polygon([(5, 0), (7, 0), (7, 2), (5, 2)])
+    poly3 = Polygon([(0, 5), (2, 5), (2, 7), (0, 7)])
+    ds = gpd.GeoDataFrame({"id": [1, 2, 3], "geometry": [poly1, poly2, poly3]}, crs="EPSG:32610")
+
+    # Get all VectorBase public properties and methods, ensures we test everything even with API changes
+    properties = [k for k, v in VectorBase.__dict__.items() if not k.startswith("_") and isinstance(v, property)]
+    methods = [k for k, v in VectorBase.__dict__.items() if not k.startswith("_") and not isinstance(v, property)]
+    methods = [m for m in methods if m not in ["geometry_mask", "plot", "save"]]
+
+    def test_geo_interface__features_and_bbox(self) -> None:
+        """Checks that a vector exposes its geometries, columns and total bounding box."""
+
+        # Create matching class and accessor representations of the same three polygon features
+        vector = Vector(self.ds)
+        ds = self.ds.copy()
+        expected_bbox = rio.coords.BoundingBox(left=0, bottom=0, right=7, top=7)
+        expected_interface = ds.__geo_interface__
+
+        # Check the common name and compatibility alias for the total bounding box
+        assert vector.bbox == expected_bbox
+        assert vector.bounds == expected_bbox
+        assert ds.vct.bbox == expected_bbox
+        assert ds.vct.bounds == expected_bbox
+
+        # Check that the interface preserves every geometry and the integer feature column
+        assert vector.__geo_interface__ == expected_interface
+
+    @pytest.mark.parametrize("prop", properties)
+    def test_properties__equality(self, prop: str) -> None:
+        """
+        Test that properties are exactly equal between a Vector and a GeoDataFrame using the "vct" accessor.
+        """
+
+        vector = Vector(self.ds)
+        ds = self.ds.copy()
+
+        output_vector = getattr(vector, prop)
+        output_ds = getattr(ds.vct, prop)
+
+        if prop == "name":
+            assert output_vector is output_ds
+        else:
+            assert_output_equal(output_vector, output_ds)
+
+    methods_and_kwargs = [
+        ("copy", {}),
+        ("info", {"verbose": False}),
+        ("vector_equal", {"other": "self"}),
+        ("vector_allclose", {"other": "self"}),
+        ("crop", {"bbox": (-1, -1, 3, 3)}),
+        ("clip", {"mask": (-1, -1, 3, 3)}),
+        ("reproject", {"crs": CRS.from_epsg(4326)}),
+        ("translate", {"xoff": 1, "yoff": 2}),
+        (
+            "create_mask",
+            {"res": 1, "bounds": (-1, -1, 8, 8), "crs": CRS.from_epsg(32610), "as_array": True},
+        ),
+        (
+            "rasterize",
+            {"res": 1, "bounds": (-1, -1, 8, 8), "crs": CRS.from_epsg(32610)},
+        ),
+        ("query", {"expression": "id == 1"}),
+        (
+            "proximity",
+            {
+                "raster": Raster.from_array(
+                    data=np.zeros((5, 5)),
+                    transform=rio.transform.from_bounds(-1, -1, 8, 8, 5, 5),
+                    crs=CRS.from_epsg(32610),
+                )
+            },
+        ),
+        ("buffer_metric", {"buffer_size": 1}),
+        ("get_bbox_projected", {"out_crs": CRS.from_epsg(4326)}),
+        ("get_footprint_projected", {"out_crs": CRS.from_epsg(4326)}),
+        ("get_metric_crs", {"local_crs_type": "universal"}),
+        ("get_metric_crs", {"local_crs_type": "custom"}),
+        ("buffer_without_overlap", {"buffer_size": 1, "metric": False}),
+        ("to_geoutils", {}),
+    ]
+
+    @pytest.mark.parametrize("representation", ["vector", "geodataframe"])
+    @pytest.mark.parametrize(
+        "method,kwargs",
+        [
+            (method, kwargs)
+            for method, kwargs in methods_and_kwargs
+            if method in ("copy", "crop", "clip", "reproject", "translate", "query", "to_geoutils")
+        ],
+    )
+    def test_methods__metadata(self, method: str, kwargs: dict[str, Any], representation: str) -> None:
+        """Checks that operations preserve custom metadata."""
+
+        # Create vector with custom metadata
+        frame = self.ds.copy()
+        frame.attrs["title"] = "survey outlines"
+        source = Vector(frame) if representation == "vector" else frame
+        original = source.copy()
+
+        # Run each operation and check metadata is unchanged
+        interface = source if isinstance(source, Vector) else source.vct
+        result = getattr(interface, method)(**kwargs)
+        output_frame = result.gdf if isinstance(result, Vector) else result
+        assert output_frame.attrs["title"] == "survey outlines"
+        assert frame.attrs["title"] == "survey outlines"
+        assert_output_equal(source, original)
+
+    @pytest.mark.parametrize("loaded,chunks", [(True, None), (False, None), (False, 2)])
+    @pytest.mark.parametrize("method, kwargs", methods_and_kwargs)
+    def test_methods__equality_and_loading(
+        self, tmp_path: Path, method: str, kwargs: dict[str, Any], loaded: bool, chunks: int | None
+    ) -> None:
+        """Checks that vector methods load as needed and match in-memory class and accessor outputs."""
+
+        if not loaded:
+            pytest.importorskip("dask_geopandas")
+
+        # Write three features so chunks of 2 leave a shorter final partition
+        filename = tmp_path / "outlines.gpkg"
+        self.ds.to_file(filename, index=False)
+        eager_reference = loaded or chunks is not None
+        vector = Vector(self.ds.copy()) if eager_reference else Vector(filename)
+        ds = gu.open_vector(str(filename), load=loaded, chunks=chunks)
+        assert vector.is_loaded is eager_reference
+        assert ds.vct.is_loaded is loaded
+
+        # Run each operation through the class and accessor
+        args_vector = kwargs.copy()
+        args_ds = kwargs.copy()
+        if args_vector.get("other") == "self":
+            args_vector["other"] = vector
+            args_ds["other"] = ds
+
+        output_vector = getattr(vector, method)(**args_vector)
+        output_ds = getattr(ds.vct, method)(**args_ds)
+
+        # Check loading before comparing values, which can load deferred outputs
+        input_loaded = eager_reference or method not in ("crop", "get_bbox_projected", "get_footprint_projected")
+        assert vector.is_loaded is input_loaded
+        assert ds.vct.is_loaded is loaded
+        if isinstance(output_vector, (Vector, Raster)):
+            assert output_vector.is_loaded is (eager_reference or method != "crop")
+        if isinstance(output_ds, gpd.GeoDataFrame) or is_dask_dataframe(output_ds):
+            output_loaded = loaded or method not in ("copy", "crop", "clip", "reproject", "translate", "query")
+            assert output_ds.vct.is_loaded is output_loaded
+        elif isinstance(output_ds, Raster):
+            assert output_ds.is_loaded
+        elif isinstance(output_ds, xr.DataArray):
+            assert output_ds.rst.is_loaded
+
+        # Compare summaries without their representation-specific filenames
+        if method == "info":
+            output_vector = output_vector.splitlines()[1:]
+            output_ds = output_ds.splitlines()[1:]
+        actual = output_ds.compute() if is_dask_dataframe(output_ds) else output_ds
+        assert_output_equal(output_vector, actual, use_allclose=method == "proximity", strict_masked=False)
+        assert ds.vct.is_loaded is loaded
+
+    inplace_methods_and_kwargs = [
+        ("crop", {"bbox": (9, 9, 11, 11), "inplace": True}),
+        ("reproject", {"crs": CRS.from_epsg(4326), "inplace": True}),
+        ("translate", {"xoff": 1, "yoff": 2, "inplace": True}),
+        ("query", {"expression": "id == 1", "inplace": True}),
+    ]
+
+    @pytest.mark.parametrize("method, kwargs", [(f, k) for f, k in inplace_methods_and_kwargs])
+    def test_inplace_methods__equality(self, method: str, kwargs: dict[str, Any]) -> None:
+        """Test that in-place methods update the Vector and Pandas accessor consistently."""
+
+        vector = Vector(self.ds)
+        ds = self.ds.copy()
+
+        output_vector = getattr(vector, method)(**kwargs)
+        output_ds = getattr(ds.vct, method)(**kwargs)
+
+        assert output_vector is None
+        assert output_ds is None
+        assert vector.vector_equal(Vector(ds))
+
+    def test_info(self) -> None:
+        """Test that info() contains the same main information for the class and accessor."""
+
+        vector = Vector(self.ds)
+        ds = self.ds.copy()
+
+        output_vector = vector.info(verbose=False)
+        output_ds = ds.vct.info(verbose=False)
+
+        for text in ["Coordinate system", "Extent", "Number of features", "Attributes"]:
+            assert text in output_vector
+            assert text in output_ds
+
+    def test_info__crs_name(self) -> None:
+        """Checks that info reports the CRS name for 2D, compound and missing CRS metadata."""
+
+        # 1/ Define the CRS cases to apply to the same vector data
+        horizontal_crs = CRS.from_epsg(32610)
+        compound_crs = CompoundCRS("Horizontal and vertical test CRS", [horizontal_crs, CRS.from_epsg(5773)])
+        crs_cases = [
+            (horizontal_crs, "WGS 84 / UTM zone 10N"),
+            (compound_crs, "Horizontal and vertical test CRS"),
+            (None, None),
+        ]
+
+        # 2/ Check that Vector and the Pandas accessor report the same readable name
+        for crs, expected_name in crs_cases:
+            ds = self.ds.set_crs(crs, allow_override=True)
+            vector = Vector(ds)
+            expected_line = f"Coordinate system:  {[expected_name]}"
+
+            assert expected_line in vector.info(verbose=False).split("\n")
+            assert expected_line in ds.vct.info(verbose=False).split("\n")
+
+    def test_equality__cross_type_and_tolerance(self) -> None:
+        """Check that equality accepts both APIs while allclose tolerates small coordinate differences."""
+
+        vector = Vector(self.ds)
+        close_ds = self.ds.copy()
+        close_ds.geometry = close_ds.geometry.translate(xoff=1e-9)
+
+        assert vector.vector_equal(self.ds.vct)
+        assert self.ds.vct.vector_equal(vector)
+        assert not vector.vector_equal(close_ds)
+        assert vector.vector_allclose(close_ds, atol=1e-8)
+        assert close_ds.vct.vector_allclose(vector, atol=1e-8)
+        assert not vector.vector_allclose(close_ds, rtol=0, atol=1e-10)
+
+    def test_shared_methods_are_owned_by_base(self) -> None:
+        """Check that GeoUtils operations shared with the accessor are not redefined on Vector."""
+
+        shared_methods = {"vector_equal", "vector_allclose", "crop", "clip", "reproject", "rasterize", "proximity"}
+        assert shared_methods <= set(VectorBase.__dict__)
+        assert shared_methods.isdisjoint(Vector.__dict__)
+
+    def test_methods__test_coverage(self) -> None:
+        """Test that checks that all existing VectorBase methods are tested above."""
+
+        methods_1 = [m[0] for m in self.methods_and_kwargs]
+        methods_2 = [m[0] for m in self.class_methods_and_kwargs]
+        list_missing = [method for method in self.methods if method not in methods_1 + methods_2]
+
+        if len(list_missing) != 0:
+            raise NeedsTestError(f"VectorBase methods not covered by tests: {list_missing}")
+
+    class_methods_and_kwargs = [
+        (
+            "from_bounds_projected",
+            {"raster_or_vector": Vector(ds), "out_crs": CRS.from_epsg(4326)},
+        ),
+    ]
+
+    @pytest.mark.parametrize("method, kwargs", [(f, k) for f, k in class_methods_and_kwargs])
+    def test_classmethods__equality(self, method: str, kwargs: dict[str, Any]) -> None:
+        """Test class method output exactly the same objects."""
+
+        output_vector = getattr(Vector, method)(**kwargs)
+        output_ds = getattr(GeoDataFrameVectorAccessor, method)(**kwargs)
+
+        assert_output_equal(output_vector, output_ds)
+
+
+class TestVectorRemote:
+    """Test module for remote vector reading (in the cloud)."""
+
+    @pytest.mark.parametrize("suffix", ["geojson", "gpkg", "fgb"])
+    def test_init__remote(self, remote_files: RemoteFiles, remote_url: Callable[[str], str], suffix: str) -> None:
+        """Checks remote vector reading."""
+
+        # We write a vector file, then read local/remote
+        frame = gpd.GeoDataFrame({"id": [1, 2]}, geometry=[box(0, 0, 2, 3), box(4, 5, 7, 9)], crs=4326)
+        filename = remote_files.directory / f"polygons.{suffix}"
+        frame.to_file(filename)
+        expected = gu.Vector(filename)
+        remote = gu.Vector(remote_url(filename.name))
+
+        # Check loading and metadata
+        assert not expected.is_loaded
+        assert not remote.is_loaded
+        assert remote.crs == expected.crs
+        assert remote.bounds == expected.bounds
+        assert remote.columns.equals(expected.columns)
+
+        # Load both files and check everything
+        remote.load()
+        expected.load()
+        assert remote.is_loaded
+        assert_geodataframe_equal(remote.gdf, expected.gdf)
+
+        # Check that remote reads requested part of a file
+        assert any(method == "GET" and filename.name in path for method, path, byte_range in remote_files.requests)
+        assert any(method == "GET" and byte_range for method, path, byte_range in remote_files.requests)
+
+    @pytest.mark.parametrize("suffix", ["geojson", "gpkg", "fgb"])
+    def test_open_vector__remote(
+        self, remote_files: RemoteFiles, remote_url: Callable[[str], str], suffix: str
+    ) -> None:
+        """Checks that open_vector() reads the same geometries, attributes and CRS from remote and local files."""
+
+        # Write a vector file, then open local/remote
+        frame = gpd.GeoDataFrame({"id": [1, 2]}, geometry=[box(0, 0, 2, 3), box(4, 5, 7, 9)], crs=4326)
+        filename = remote_files.directory / f"polygons.{suffix}"
+        frame.to_file(filename)
+        expected = gu.open_vector(str(filename), load=True)
+        remote = gu.open_vector(remote_url(filename.name), load=True)
+
+        # Check loading and equality
+        assert isinstance(remote, gpd.GeoDataFrame)
+        assert expected.vct.is_loaded
+        assert remote.vct.is_loaded
+        assert_geodataframe_equal(remote, expected)
+
+        # Check that remote reads requested part of a file
+        assert any(method == "GET" and filename.name in path for method, path, byte_range in remote_files.requests)
+        assert any(method == "GET" and byte_range for method, path, byte_range in remote_files.requests)
+
+
+class TestVectorRemoteChunked:
+    """Test module for remote vector files with lazy/chunked Dask reading."""
+
+    @pytest.mark.parametrize("suffix", ["geojson", "gpkg", "fgb"])
+    def test_open_vector__remote_laziness(
+        self, remote_files: RemoteFiles, remote_url: Callable[[str], str], suffix: str
+    ) -> None:
+        """Checks that remote files can be read in chunked lazily."""
+
+        pytest.importorskip("dask_geopandas")
+
+        # Write polygons
+        geometries = [box(index * 3, 0, index * 3 + 1, 1) for index in range(5)]
+        frame = gpd.GeoDataFrame({"id": np.arange(5)}, geometry=geometries, crs=4326)
+        filename = remote_files.directory / f"polygons.{suffix}"
+        frame.to_file(filename)
+
+        # Open local/remote with chunks (Dask)
+        expected = gu.open_vector(str(filename), load=True)
+        remote = gu.open_vector(remote_url(filename.name), chunks=2)
+        assert expected.vct.is_loaded
+        assert not remote.vct.is_loaded
+        assert remote.npartitions == 3
+
+        # Compute and check equality without loading the original object
+        computed = remote.compute(scheduler="synchronous")
+        assert_geodataframe_equal(computed, expected)
+        assert computed.vct.is_loaded
+        assert not remote.vct.is_loaded
+
+        # Check that remote reads requested part of a file
+        assert any(method == "GET" and filename.name in path for method, path, byte_range in remote_files.requests)
+        assert any(method == "GET" and byte_range for method, path, byte_range in remote_files.requests)
+
+
+class TestVectorRemoteErrors:
+    """Test module for errors/warnings on remote files."""
+
+    def test_init__error_missing_remote_file(self, remote_url: Callable[[str], str]) -> None:
+        """Checks an error is raised when a remote vector file is unavailable."""
+
+        with pytest.raises(pyogrio.errors.DataSourceError):
+            gu.Vector(remote_url("missing.gpkg"))
+
+    @pytest.mark.parametrize("chunks", [None, 2])
+    def test_open_vector__error_missing_remote_file(self, remote_url: Callable[[str], str], chunks: int | None) -> None:
+        """Checks an error is raised when open_vector() cannot find a remote file, with or without chunks."""
+
+        if chunks is not None:
+            pytest.importorskip("dask_geopandas")
+
+        # GeoPandas checks HTTP URLs directly, chunked and S3 reads report GDAL errors
+        filename = remote_url("missing.gpkg")
+        error = HTTPError if chunks is None and filename.startswith("http://") else pyogrio.errors.DataSourceError
+        with pytest.raises(error):
+            gu.open_vector(filename, chunks=chunks, load=True)

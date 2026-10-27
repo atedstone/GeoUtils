@@ -19,9 +19,9 @@ class TestEstimators:
 
         # Check that the NMAD is computed the same with a masked array or NaN array, and is equal to scipy nmad
         nmad_ma = nmad(self.landsat_raster.data)
-        nmad_array = nmad(self.landsat_raster.get_nanarray(floating_dtype="float64"))
+        nmad_array = nmad(self.landsat_raster.to_nanarray(floating_dtype="float64"))
         nmad_scipy = scipy.stats.median_abs_deviation(
-            self.landsat_raster.get_nanarray(floating_dtype="float64"), axis=None, scale="normal"
+            self.landsat_raster.to_nanarray(floating_dtype="float64"), axis=None, scale="normal"
         )
 
         assert nmad_ma == nmad_array
@@ -38,7 +38,7 @@ class TestEstimators:
 
         # Compute LE on the landsat raster data for a default interval (LE90)
         le_ma = linear_error(self.landsat_raster.data)
-        le_nan_array = linear_error(self.landsat_raster.get_nanarray())
+        le_nan_array = linear_error(self.landsat_raster.to_nanarray())
 
         # Assert the LE90 is computed the same for masked array and NaN array
         assert le_ma == le_nan_array
@@ -82,7 +82,7 @@ class TestEstimators:
         assert rmse_data == pytest.approx(3.0276503540974917)
 
     def test_sum_square(self) -> None:
-        """Test Sum Square functionality runs on any type of input"""
+        """Test sum square functionality runs on any type of input"""
 
         test_data = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
         # Test masked arrays with invalid data (should ignore NaNs/masked values)
@@ -95,3 +95,16 @@ class TestEstimators:
 
         assert sum_square_data == sum_square_masked_data
         assert sum_square_data == 55
+
+    @pytest.mark.parametrize("masked", [False, True])
+    def test_sum_square_and_rmse__integer_overflow(self, masked: bool) -> None:
+        """Checks that sum_square() and rmse() promote integer values before squaring."""
+
+        # Use values whose squares exceed int16, with one optional value excluded by a NumPy mask
+        values = np.array([[2000, 3000], [5000, 4000]], dtype=np.int16)
+        source = np.ma.array(values, mask=[[False, True], [False, False]]) if masked else values
+        reference = source.astype(np.float64)
+
+        # Compare both estimators with arithmetic performed after conversion to floating point
+        assert sum_square(source) == pytest.approx(np.ma.sum(reference**2))
+        assert rmse(source) == pytest.approx(np.sqrt(np.ma.mean(reference**2)))

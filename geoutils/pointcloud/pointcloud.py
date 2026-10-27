@@ -1,4 +1,4 @@
-# Copyright (c) 2025 GeoUtils developers
+# Copyright (c) 2026 GeoUtils developers
 #
 # This file is part of the GeoUtils project:
 # https://github.com/glaciohack/geoutils
@@ -19,46 +19,48 @@
 
 from __future__ import annotations
 
-import logging
 import os.path
 import pathlib
-import warnings
 from typing import (
-    TYPE_CHECKING,
     Any,
     Callable,
-    Iterable,
     Literal,
     TypeVar,
     Union,
+    cast,
     overload,
 )
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import xarray as xr
 from pyproj import CRS
 from rasterio.coords import BoundingBox
 from shapely.geometry.base import BaseGeometry
 
 from geoutils import profiler
-from geoutils._dispatch import _check_match_grid, get_geo_attr, has_geo_attr
-from geoutils._misc import import_optional
-from geoutils._typing import ArrayLike, DTypeLike, NDArrayBool, NDArrayNum, Number
-from geoutils.interface.gridding import _grid_pointcloud
-from geoutils.raster.georeferencing import _coords
-from geoutils.stats.sampling import subsample_array
-from geoutils.stats.stats import _statistics
-from geoutils.vector.vector import Vector, VectorLike
-
-if TYPE_CHECKING:
-    import matplotlib
-
-    from geoutils.raster.base import RasterLike, RasterType
+from geoutils._dispatch import is_dask_array, is_dask_dataframe
+from geoutils._misc import _deprecate_keyword, _validate_downsample
+from geoutils._typing import DTypeLike, NDArrayBool, NDArrayNum, Number
+from geoutils.multiproc import MultiprocConfig
+from geoutils.pointcloud.base import GeometryPointCloudBase, PointCloudBase
+from geoutils.pointcloud.las import (
+    _is_laspy_supported,
+    _load_laspy_data,
+    _load_laspy_data_bounds,
+    _load_laspy_data_partitions,
+    _load_laspy_metadata,
+    _point_partition_size,
+    _write_laspy,
+)
+from geoutils.pointcloud.parquet import _is_parquet_supported
+from geoutils.vector.transformation import _apply_crop_filters, _crop_read_bbox
+from geoutils.vector.vector import Vector
 
 # This is a generic Vector-type (if subclasses are made, this will change appropriately)
 PointCloudType = TypeVar("PointCloudType", bound="PointCloud")
-PointCloudLike = Union["PointCloud", gpd.GeoDataFrame]
+PointCloudLike = Union[PointCloudBase, gpd.GeoDataFrame, xr.DataArray]
 
 # List of NumPy "array" functions that are handled.
 # Note: all universal function are supported: https://numpy.org/doc/stable/reference/ufuncs.html
@@ -127,249 +129,193 @@ _HANDLED_FUNCTIONS_2NIN = [
 handled_array_funcs = _HANDLED_FUNCTIONS_1NIN + _HANDLED_FUNCTIONS_2NIN
 
 
-def _load_laspy_data(filename: str, columns: list[str]) -> gpd.GeoDataFrame:
-    """Load point cloud data from LAS/LAZ/COPC file as a geodataframe."""
-
-    laspy = import_optional("laspy")
-
-    # Read file
-    las = laspy.read(filename)
-
-    # Get data from main Z column and other requested columns
-    columns_no_z = [c for c in columns if c != "Z"]
-    data = np.vstack([las.z] + [las[n] for n in columns_no_z]).T
-    column_names = ["Z"] + columns_no_z
-
-    # Build geodataframe
-    gdf = gpd.GeoDataFrame(
-        geometry=gpd.points_from_xy(x=las.x, y=las.y, crs=las.header.parse_crs(prefer_wkt=False)),
-        data=data,
-        columns=column_names,
-    )
-
-    return gdf
-
-
-def _load_laspy_metadata(
-    filename: str,
-) -> tuple[CRS, int, BoundingBox, pd.Index]:
-    """Load point cloud metadata from LAS/LAZ/COPC file."""
-
-    laspy = import_optional("laspy")
-
-    with laspy.open(filename) as f:
-
-        # Parse CRS, point count and bounds
-        crs = f.header.parse_crs(prefer_wkt=False)
-        nb_points = f.header.point_count
-        bounds = BoundingBox(left=f.header.x_min, right=f.header.x_max, bottom=f.header.y_min, top=f.header.y_max)
-
-        # Parse column names as pandas index, removing X/Y that will be transformed into a geometry
-        columns_names = list(f.header.point_format.dimension_names)
-        columns_names = [c for c in columns_names if c not in ["X", "Y"]]
-        columns_names = pd.Index(columns_names)
-
-    return crs, nb_points, bounds, columns_names
-
-
-def _write_laspy(
-    filename: str | pathlib.Path,
-    pc: gpd.GeoDataFrame,
-    data_column: str | None,
-    version: Any = None,
-    point_format: Any = None,
-    offsets: tuple[float, float, float] = None,
-    scales: tuple[float, float, float] = None,
-    **kwargs: Any,
-) -> None:
-    """Write a point cloud geodataframe to a LAS/LAZ/COPC file."""
-
-    laspy = import_optional("laspy")
-
-    # Initiate header with user arguments
-    header = laspy.LasHeader(version=version, point_format=point_format)
-    if scales is not None:
-        header.scales = np.array(scales)
-    if offsets is not None:
-        header.offsets = np.array(offsets)
-    for k, v in kwargs.items():
-        setattr(header, k, v)
-
-    # Adding extra dimensions for auxiliary variables
-    aux_columns = [c for c in pc.columns if c not in [data_column, "geometry"]]
-    for c in aux_columns:
-        header.add_extra_dim(laspy.ExtraBytesParams(name=c, type=pc[c].dtype))
-
-    las = laspy.LasData(header)
-
-    # The las x,y,z will be automatically scaled into X,Y,Z based on the header scales
-    las.x = pc.geometry.x.values
-    las.y = pc.geometry.y.values
-    if data_column is not None:
-        las.z = pc[data_column].values
-    else:
-        las.z = pc.geometry.z.values
-
-    # Add auxiliary columns
-    for c in aux_columns:
-        setattr(las, c, pc[c].values)
-
-    las.write(filename)
-
-    return
-
-
 def _cast_numeric_array_pointcloud(
-    pc: PointCloudType, other: PointCloudType | NDArrayNum | Number, operation_name: str
-) -> NDArrayNum | Number:
-    """
-    Cast a point cloud and another point cloud or array or number to arrays with proper metadata, or raise an error
-    message.
+    pc: PointCloudType, other: PointCloudType | NDArrayNum | Number | Any, operation_name: str
+) -> Any:
+    """Cast point-cloud arithmetic inputs to compatible arrays or scalar values."""
 
-    :param pc: Pointcloud.
-    :param other: Point cloud or array or number.
-    :param operation_name: Name of operation to raise in the error message.
-    """
-
-    # Check first input is a point cloud
-    if not isinstance(pc, PointCloud):
-        raise ValueError("Developer error: Only a point cloud should be passed as first argument to this function.")
-
-    # Check that other is of correct type
-    # If not, a NotImplementedError should be raised, in case other's class has a method implemented.
-    # See https://docs.python.org/3/reference/datamodel.html#emulating-numeric-types
-    if not isinstance(other, (PointCloud, np.ndarray, float, int, np.floating, np.integer)):
-        raise NotImplementedError(
-            f"Operation between an object of type {type(other)} and a point cloud impossible. Must be a point cloud, "
-            f"np.ndarray or single number."
-        )
-
-    # If other is a point cloud
     if isinstance(other, PointCloud):
-
-        other_data = other.data
-        # Check that both point clouds have the same shape and georeferences
-        if pc.georeferenced_coords_equal(other):  # type: ignore
-            pass
-        else:
+        if not pc.georeferenced_coords_equal(other):
             raise ValueError(
                 "Both point clouds must have the same points X/Y coordinates and CRS for " + operation_name + "."
             )
+        return other.data
 
-    # If other is an array
-    elif isinstance(other, np.ndarray):
-
-        other_data = other.squeeze()
-        if other.squeeze().ndim == 1 and other.squeeze().shape[0] == pc.point_count:
-            pass
-        else:
+    try:
+        other_pc = cast(Any, other).pc
+    except AttributeError:
+        other_pc = None
+    if isinstance(other_pc, PointCloudBase):
+        if not pc.georeferenced_coords_equal(other_pc):
             raise ValueError(
-                "The array must be 1-dimensional with the same number of points as the point cloud for "
-                + operation_name
-                + "."
+                "Both point clouds must have the same points X/Y coordinates and CRS for " + operation_name + "."
             )
+        return other_pc.data
 
-    else:
-        other_data = other  # type: ignore
+    if isinstance(other, (np.ndarray, pd.Series)):
+        other_data = np.asarray(other).squeeze()
+        if other_data.ndim == 1 and other_data.shape[0] == pc.point_count:
+            return other_data
+        raise ValueError(
+            "The array must be 1-dimensional with the same number of points as the point cloud for "
+            + operation_name
+            + "."
+        )
 
-    return other_data
+    if isinstance(other, (float, int, np.floating, np.integer)):
+        return other
+    if is_dask_array(other) or is_dask_dataframe(other):
+        return other
+    raise NotImplementedError(
+        f"Operation between an object of type {type(other)} and a point cloud impossible. Must be a point cloud, "
+        f"np.ndarray or single number."
+    )
 
 
-class PointCloud(Vector):  # type: ignore[misc]
+class PointCloud(GeometryPointCloudBase, Vector):  # type: ignore[misc]
     """
     The georeferenced point cloud.
 
-    A point cloud is a vector of 2D point geometries associated to numeric values from a main data column, and can
-    also contain auxiliary data columns.
+    A point cloud is a vector of 2D point geometries associated to numeric values from a main data attribute, and can
+    also contain auxiliary data attributes.
 
      Main attributes:
-        ds: :class:`geopandas.GeoDataFrame`
+        gdf: :class:`geopandas.GeoDataFrame`
             Geodataframe of the point cloud.
-        data_column: str
-            Name of point cloud data column.
+        data_name: str
+            Name of point cloud data attribute.
         crs: :class:`pyproj.crs.CRS`
             Coordinate reference system of the point cloud.
-        bounds: :class:`rio.coords.BoundingBox`
-            Coordinate bounds of the point cloud.
+        bbox: :class:`rio.coords.BoundingBox`
+            Bounding box of the point cloud.
 
 
     All other attributes are derivatives of those attributes, or read from the file on disk.
     See the API for more details.
     """
 
-    @profiler.profile("geoutils.pointcloud.pointcloud.__init__", memprof=True)
+    # Resolve the shared abstract storage through Vector's native GeoDataFrame
+    _dataset = Vector._dataset
+
+    @_deprecate_keyword("data_column", "data_name")
+    @profiler.profile("geoutils.pointcloud.pointcloud.__init__", collect=False)
     def __init__(
         self,
         filename_or_dataset: str | pathlib.Path | gpd.GeoDataFrame | gpd.GeoSeries | BaseGeometry,
-        data_column: str | None = None,
+        data_name: str | None = None,
+        downsample: Number = 1,
     ):
         """
-        Instantiate a point cloud from either a data column name and a vector (filename, GeoPandas dataframe or series,
-        or a Shapely geometry), or only with a point cloud file type.
+        Instantiate a point cloud from either a data attribute name and a vector (filename, GeoPandas dataframe or
+        series, or a Shapely geometry), or only with a point cloud file type.
 
         :param filename_or_dataset: Path to vector file, or GeoPandas dataframe or series, or Shapely geometry.
-        :param data_column: Name of main data column defining the point cloud (not required for LAS/LAZ formats).
+        :param data_name: Name of main data attribute defining the point cloud (not required for LAS/LAZ formats).
+        :param downsample: Factor by which to reduce the number of points when data are loaded. For example, 2 keeps
+            up to ``ceil(N / 2)`` points selected by a deterministic random sample. The default 1 keeps all points.
         """
 
         self._ds: gpd.GeoDataFrame | None = None
         self._name: str | None = None
         self._crs: CRS | None = None
-        self._data_column: str | None = None
-        self._bounds: BoundingBox
+        self._data_name: str | None = None
+        self._bbox: BoundingBox
+        self._columns: pd.Index | None = None
+        self._feature_count: int | None = None
+        self._geometry_type: str | None = None
+        self._crop_filters: list[tuple[tuple[float, float, float, float], Literal["intersects", "within"]]] = []
         self._data: NDArrayNum
         self._nb_points: int
         self.__nongeo_columns: pd.Index
+        self._is_las = False
+        self._downsample = _validate_downsample(downsample)
+        self._downsample_applied = False
 
         # If PointCloud is passed, simply point back to PointCloud
         if isinstance(filename_or_dataset, PointCloud):
             for key in filename_or_dataset.__dict__:
                 setattr(self, key, filename_or_dataset.__dict__[key])
+            if downsample != 1:
+                self._downsample = _validate_downsample(downsample)
+                self._downsample_applied = False
+                if self.is_loaded:
+                    self._apply_downsample()
             return
         # For filename, rely on parent Vector class or LAS file reader
         else:
-            if isinstance(filename_or_dataset, (str, pathlib.Path)) and os.path.splitext(filename_or_dataset)[-1] in [
-                ".las",
-                ".laz",
-            ]:
-
+            if isinstance(filename_or_dataset, (str, pathlib.Path)) and _is_laspy_supported(filename_or_dataset):
+                self._is_las = True
                 # No need to pass a data column for LAS/LAZ file, as Z is the logical default
-                if data_column is None:
-                    data_column = "Z"
+                if data_name is None:
+                    data_name = "Z"
                 # Load only metadata, and not the data
-                fn = filename_or_dataset if isinstance(filename_or_dataset, str) else filename_or_dataset.name
-                crs, nb_points, bounds, columns = _load_laspy_metadata(fn)
+                fn = os.fspath(filename_or_dataset)
+                metadata = _load_laspy_metadata(fn)
                 self._name = fn
-                self._crs = crs
-                self._nb_points = nb_points
-                self.__nongeo_columns = columns
-                self._bounds = bounds
+                self._crs = metadata.crs
+                self._nb_points = metadata.point_count
+                self.__nongeo_columns = metadata.columns
+                self._bbox = metadata.bounds
+                self._columns = pd.Index(list(metadata.columns) + ["geometry"])
+                self._feature_count = metadata.point_count
+                self._geometry_type = "Point"
                 self._ds = None
+            elif isinstance(filename_or_dataset, (str, pathlib.Path)) and _is_parquet_supported(filename_or_dataset):
+                from geoutils.pointcloud.parquet import _point_parquet_metadata
+
+                parquet_metadata = _point_parquet_metadata(filename_or_dataset)
+                self._name = os.fspath(filename_or_dataset)
+                self._crs = parquet_metadata["crs"]
+                self._nb_points = parquet_metadata["point_count"]
+                self.__nongeo_columns = pd.Index(parquet_metadata["columns"])
+                self._columns = pd.Index(
+                    parquet_metadata["attrs"].get("dataframe_columns", [*parquet_metadata["columns"], "geometry"])
+                )
+                self._bbox = parquet_metadata["bounds"]
+                self._feature_count = parquet_metadata["point_count"]
+                self._geometry_type = parquet_metadata["geometry_type"]
+                if data_name is None and not parquet_metadata["attrs"].get("geometry_z"):
+                    data_name = parquet_metadata["attrs"].get("data_name")
+                if data_name is None and self._geometry_type != "Point Z":
+                    data_name = (
+                        "Z"
+                        if "Z" in parquet_metadata["columns"]
+                        else (parquet_metadata["columns"][0] if parquet_metadata["columns"] else None)
+                    )
             # Check on filename are done with Vector.__init__
             else:
                 super().__init__(filename_or_dataset)
-                # Verify that the vector can be cast as a point cloud
-                if not all(p == "Point" for p in self.ds.geom_type):
+                if not self.is_loaded:
+                    if self._geometry_type is not None and "Point" not in self._geometry_type:
+                        raise ValueError(
+                            "This vector file contains non-point geometries, cannot be instantiated as a point cloud."
+                        )
+                    self.__nongeo_columns = pd.Index([c for c in Vector.columns.fget(self) if c != "geometry"])
+                    self._nb_points = self._feature_count if self._feature_count is not None else -1
+                elif not all(p == "Point" for p in self.gdf.geom_type):
                     raise ValueError(
-                        "This vector file contains non-point geometries, " "cannot be instantiated as a point cloud."
+                        "This vector file contains non-point geometries, cannot be instantiated as a point cloud."
                     )
 
         # Set data column name based on user input
-        self.set_data_column(new_data_column=data_column)
+        self.set_data_name(new_data_name=data_name)
+        if self.is_loaded:
+            self._apply_downsample()
 
     ##############################################
     # OVERRIDDEN VECTOR METHODS TO SUPPORT LOADING
     ##############################################
 
     @property
-    def ds(self) -> gpd.GeoDataFrame:
+    def gdf(self) -> gpd.GeoDataFrame:
         """Geodataframe of the point cloud."""
         # We need to override the Vector method to introduce the is_loaded dynamic for LAS files
         if not self.is_loaded:
             self.load()
         return self._ds  # type: ignore
 
-    @ds.setter
-    def ds(self, new_ds: gpd.GeoDataFrame | gpd.GeoSeries) -> None:
+    @gdf.setter
+    def gdf(self, new_ds: gpd.GeoDataFrame | gpd.GeoSeries) -> None:
         """Set a new geodataframe for the point cloud."""
         # We need to override the setter Vector method because we have overridden the property method
         # (even if the code below is the same)
@@ -379,66 +325,41 @@ class PointCloud(Vector):  # type: ignore[misc]
             self._ds = gpd.GeoDataFrame(geometry=new_ds)
         else:
             raise ValueError("The dataset of a vector must be set with a GeoSeries or a GeoDataFrame.")
+        self._set_metadata_from_ds(self._ds)
 
     @property
     def crs(self) -> CRS:
-        """Coordinate reference system of the vector."""
-
         # Overriding method in Vector in case dataset is not loaded
         if self.is_loaded:
             return super().crs
-        # Return CRS on disk
-        else:
-            return self._crs
+        return self._crs
 
     @property
-    def bounds(self) -> BoundingBox:
+    def bbox(self) -> BoundingBox:
+        """Total bounding box of the point cloud."""
+
         # Overriding method in Vector in case dataset is not loaded
         if self.is_loaded:
-            return super().bounds
-        # Return bounds on disk
-        else:
-            return self._bounds
+            return super().bbox
+        return self._bbox
 
+    @property
     def columns(self) -> pd.Index:
+        """Names of point attributes and geometry, read from file metadata before loading."""
+
         # Overriding method in Vector in case dataset is not loaded
         if self.is_loaded:
             return super().columns
-        # Return columns on disk (adding a placeholder geometry to replace X/Y)
-        else:
+        if self.name is not None and _is_parquet_supported(self.name):
+            return self._columns
+        if self._is_las:
+            # Return columns on disk (adding a placeholder geometry to replace X/Y)
             return pd.Index(list(self._nongeo_columns) + ["geometry"])
+        return Vector.columns.fget(self)
 
     #####################################
-    # NEW METHODS SPECIFIC TO POINT CLOUD
+    # METHODS SPECIFIC TO POINT CLOUD
     #####################################
-
-    @property
-    def _has_z(self) -> bool:
-        """Whether the point geometries all have a Z coordinate or not."""
-
-        return all(p.has_z for p in self.ds.geometry) if len(self.ds.geometry) > 0 else False
-
-    @property
-    def data(self) -> NDArrayNum:
-        """
-        Data of the point cloud.
-
-        Points to either the Z axis of the point geometries, or the associated data column of the geodataframe.
-        """
-        # Triggers the loading mechanism through self.ds
-        if self.data_column is not None:
-            return self.ds[self.data_column].values
-        else:
-            return self.geometry.z.values
-
-    @data.setter
-    def data(self, new_data: NDArrayNum) -> None:
-        """Set new data for the point cloud."""
-
-        if self.data_column is not None:
-            self.ds[self.data_column] = new_data
-        else:
-            self.ds.geometry = gpd.points_from_xy(x=self.geometry.x, y=self.geometry.y, z=new_data, crs=self.crs)
 
     @property
     def _nongeo_columns(self) -> pd.Index:
@@ -448,76 +369,20 @@ class PointCloud(Vector):  # type: ignore[misc]
             nongeo_columns = super().columns
             nongeo_columns = nongeo_columns[nongeo_columns != "geometry"]
             return nongeo_columns
-        else:
-            return self.__nongeo_columns
+        return self.__nongeo_columns
 
-    @property
-    def data_column(self) -> str | None:
-        """
-        Name of data column of the point cloud.
-
-        Can be None if point geometries are 3D.
-        """
-        return self._data_column
-
-    @data_column.setter
-    def data_column(self, new_data_column: str) -> None:
-        self.set_data_column(new_data_column=new_data_column)
-
-    def set_data_column(self, new_data_column: str | None) -> None:
-        """Set new column as point cloud data column."""
-
-        # If point geometries are 3D, only for loaded data (otherwise _has_z would load data)
-        if self.is_loaded:
-            if self._has_z:
-                if new_data_column is None:
-                    self._data_column = None
-                    return
-                else:
-                    warnings.warn(
-                        f"Overriding 3D points with with data column '{new_data_column}'. Set data_column "
-                        f"to None to use the 3D point geometries instead."
-                    )
-
-        # If point geometries are 2D and the data column is undefined
-        if new_data_column is None:
-            raise ValueError("A data column name must be passed for a point cloud with 2D point geometries.")
-
-        # If 2D and data column is defined, check that it exists
-        if new_data_column not in self._nongeo_columns:
-            raise ValueError(
-                f"Data column {new_data_column} not found among columns. Available columns "
-                f"are: {', '.join(self._nongeo_columns)}."
-            )
-
-        # Set data column name
-        self._data_column = new_data_column
-
-    @property
-    def is_loaded(self) -> bool:
-        """Whether the point cloud data is loaded."""
-        return self._ds is not None
-
-    @property
-    def point_count(self) -> int:
-        """Number of points in the point cloud."""
-        # New method for point cloud
-        if self.is_loaded:
-            return len(self.ds)
-        else:
-            return self._nb_points
-
-    @property
-    def is_mask(self) -> bool:
-        """Whether the point cloud mask is a mask (boolean type)."""
-
-        return np.dtype(self.data.dtype) == np.bool_
-
-    def load(self, columns: Literal["all", "main"] | list[str] = "main") -> None:
+    def load(
+        self,
+        columns: Literal["all", "main"] | list[str] = "main",
+        mp_config: MultiprocConfig | None = None,
+        **kwargs: Any,
+    ) -> None:
         """
         Load point cloud from disk (only supported for LAS files).
 
-        :param columns: Columns to load. Defaults to main data column only.
+        :param columns: Columns to load. Defaults to main data attribute only.
+        :param mp_config: Optional multiprocessing configuration to load LAS/LAZ files by chunks.
+        :param kwargs: Optional keyword arguments passed to :func:`geopandas.read_file` for non-LAS files.
         """
 
         if self.is_loaded:
@@ -528,34 +393,121 @@ class PointCloud(Vector):  # type: ignore[misc]
                 "Cannot load as filename is not set anymore. Did you manually update the filename attribute?"
             )
 
+        if _is_parquet_supported(self.name):
+            from geoutils.pointcloud.parquet import _open_point_parquet
+
+            points = _open_point_parquet(self.name, data_name=self.data_name, columns="all")
+            self._ds = points.pc.to_geoutils().gdf
+            self._ds = _apply_crop_filters(self._ds, self._crop_filters)
+            self._crop_filters = []
+            self._apply_downsample()
+            return
+
+        if not self._is_las:
+            Vector.load(self, **kwargs)
+            if not all(p == "Point" for p in self.gdf.geom_type):
+                raise ValueError(
+                    "This vector file contains non-point geometries, cannot be instantiated as a point cloud."
+                )
+            self.set_data_name(new_data_name=self._data_name)
+            self._apply_downsample()
+            return
+
+        # Match accessor level selection before sampling a COPC file
+        if self._downsample > 1 and not self._crop_filters and _load_laspy_metadata(self.name).is_copc:
+            from geoutils.pointcloud.loading import open_pointcloud
+
+            self._ds = open_pointcloud(
+                self.name,
+                data_name=self.data_name,
+                columns=columns,
+                downsample=self._downsample,
+                as_object_type="geodataframe",
+                load=True,
+            )
+            self._downsample_applied = True
+            return
+
         if columns == "all":
             columns_to_load = self._nongeo_columns
         elif columns == "main":
-            columns_to_load = [self.data_column]
+            columns_to_load = [self.data_name]
         else:
             columns_to_load = columns
 
-        ds = _load_laspy_data(filename=self.name, columns=columns_to_load)
+        # Use bounded LAS/COPC reading when crop() stored a deferred spatial selection
+        read_bbox = _crop_read_bbox(self._crop_filters)
+        if read_bbox is not None:
+            ds = _load_laspy_data_bounds(
+                filename=self.name,
+                columns=columns_to_load,
+                bounds=read_bbox,
+                data_name=self.data_name,
+            )
+            ds = _apply_crop_filters(ds, self._crop_filters)
+        elif mp_config is None:
+            ds = _load_laspy_data(filename=self.name, columns=columns_to_load, data_name=self.data_name)
+        else:
+            ds = _load_laspy_data_partitions(
+                filename=self.name,
+                columns=columns_to_load,
+                point_count=self._nb_points,
+                partition_size=_point_partition_size(mp_config),
+                mp_config=mp_config,
+            )
         self._ds = ds
+        self._crop_filters = []
+        self._apply_downsample()
+
+    def _apply_downsample(self) -> None:
+        """Apply the opening downsampling factor once to the loaded point rows."""
+
+        if self._downsample_applied or self._downsample == 1:
+            return
+
+        from geoutils.pointcloud.loading import _downsample_open_pointcloud
+
+        # Share row selection with accessors, including rows with missing measurements
+        source_name = self._name
+        self.gdf = _downsample_open_pointcloud(self.gdf, self._downsample)
+        self._name = source_name
+        self._downsample_applied = True
 
     @overload
     def astype(
-        self: PointCloud, dtype: DTypeLike, convert_coords: bool = False, *, inplace: Literal[False] = False
+        self: PointCloud,
+        dtype: DTypeLike,
+        convert_coords: bool = False,
+        *,
+        inplace: Literal[False] = False,
     ) -> PointCloud: ...
 
     @overload
-    def astype(self: PointCloud, dtype: DTypeLike, convert_coords: bool = False, *, inplace: Literal[True]) -> None: ...
+    def astype(
+        self: PointCloud,
+        dtype: DTypeLike,
+        convert_coords: bool = False,
+        *,
+        inplace: Literal[True],
+    ) -> None: ...
 
     @overload
     def astype(
-        self: PointCloud, dtype: DTypeLike, convert_coords: bool = False, *, inplace: bool = False
+        self: PointCloud,
+        dtype: DTypeLike,
+        convert_coords: bool = False,
+        *,
+        inplace: bool = False,
     ) -> PointCloud | None: ...
 
     def astype(
-        self: PointCloud, dtype: DTypeLike, convert_coords: bool = False, inplace: bool = False
+        self: PointCloud,
+        dtype: DTypeLike,
+        convert_coords: bool = False,
+        inplace: bool = False,
     ) -> PointCloud | None:
         """
-        Convert data type of the point cloud data column.
+        Convert data type of the point cloud data attribute.
 
         :param dtype: Any numpy dtype or string accepted by numpy.astype.
         :param convert_coords: Whether to convert the data type of coordinates values as well.
@@ -565,63 +517,31 @@ class PointCloud(Vector):  # type: ignore[misc]
         """
 
         out_data = self.data.astype(dtype)
+        output = self if inplace else self.copy(new_array=out_data)
 
         if inplace:
-            self._data = out_data  # type: ignore
-            if convert_coords:
-                self.ds.geometry.x = self.ds.geometry.x.values.astype(dtype)
-                self.ds.geometry.y = self.ds.geometry.y.values.astype(dtype)
-            return None
-        else:
-            if convert_coords:
-                x = self.ds.geometry.x.values.astype(dtype)
-                y = self.ds.geometry.y.values.astype(dtype)
-                return self.from_xyz(x=x, y=y, z=out_data, crs=self.crs, data_column=self.data_column)
-            else:
-                return self.copy(new_array=out_data)
+            output.data = out_data
 
-    def copy(self: PointCloud, new_array: NDArrayNum | NDArrayBool | None = None) -> PointCloud:
-        """
-        Copy the point cloud in-memory.
+        if convert_coords:
+            # Replace the geometry with converted X/Y while preserving its Z values and other columns
+            geometry = output.geometry
+            x = geometry.x.to_numpy().astype(dtype)
+            y = geometry.y.to_numpy().astype(dtype)
+            z = geometry.z.to_numpy() if output._has_z else None
+            output.gdf.geometry = gpd.points_from_xy(x=x, y=y, z=z, crs=output.crs)
 
-        :param new_array: New data array to use in the copied point cloud's data column.
-
-        :return: Copy of the point cloud.
-        """
-
-        # Define new array
-        if new_array is not None:
-            if not isinstance(new_array, np.ndarray):
-                raise ValueError("New data must be an array.")
-            new_array = new_array.squeeze()
-            if not (new_array.ndim == 1 and new_array.shape[0] == self.point_count):
-                raise ValueError(
-                    "New data array must be 1-dimensional with the same number of points as the point "
-                    "cloud being copied."
-                )
-            data = new_array
-        else:
-            data = self.data.copy()
-
-        # Send to from_xyz
-        cp = self.from_xyz(
-            x=self.geometry.x.values,
-            y=self.geometry.y.values,
-            z=data,
-            crs=self.crs,
-            data_column=self.data_column,
-            use_z=self._has_z and self.data_column is None,
-        )
-
-        return cp
+        return None if inplace else output
 
     def to_las(
         self,
         filename: str | pathlib.Path,
         version: Any = None,
         point_format: Any = None,
-        offsets: tuple[float, float, float] = None,
-        scales: tuple[float, float, float] = None,
+        offsets: tuple[float, float, float] | None = None,
+        scales: tuple[float, float, float] | None = None,
+        chunks: int | None = None,
+        mp_config: MultiprocConfig | None = None,
+        laz_chunk_size: int | None = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -632,117 +552,25 @@ class PointCloud(Vector):  # type: ignore[misc]
         :param point_format: Point format.
         :param offsets: Offsets for X/Y/Z.
         :param scales: Scales for X/Y/Z.
+        :param chunks: Optional number of points per write chunk.
+        :param mp_config: Optional multiprocessing configuration for chunked writing.
+        :param laz_chunk_size: Number of points per compressed LAZ disk chunk. Requires Lazrs; None uses its default.
         :param kwargs: Other keyword arguments to set the LAS file header (e.g., "offsets", "scales").
         """
 
         _write_laspy(
             filename=filename,
-            pc=self.ds,
-            data_column=self.data_column,
+            pc=self.gdf,
+            data_name=self.data_name,
             version=version,
             point_format=point_format,
             offsets=offsets,
             scales=scales,
+            chunks=chunks,
+            mp_config=mp_config,
+            laz_chunk_size=laz_chunk_size,
             **kwargs,
         )
-
-    @classmethod
-    def from_xyz(
-        cls, x: ArrayLike, y: ArrayLike, z: ArrayLike, crs: CRS, data_column: str | None = None, use_z: bool = False
-    ) -> PointCloud:
-        """
-        Create point cloud from three 1D array-like coordinates for X/Y/Z.
-
-        Note that this is the most modular method to create a point cloud, as it allows to specify different data
-        types for the different coordinates or columns.
-
-        :param x: X coordinates of point cloud.
-        :param y: Y coordinates of point cloud.
-        :param z: Z values of point cloud.
-        :param crs: Coordinate reference system.
-        :param data_column: Data column name to associate to 2D point geometries (defaults to "z" if none is passed).
-        :param use_z: Use 3D point geometries with Z coordinates instead of a data column.
-
-        :return Point cloud.
-        """
-
-        # Build geodataframe
-        if not use_z:
-            data_column = data_column if data_column is not None else "z"
-            gdf = gpd.GeoDataFrame(
-                geometry=gpd.points_from_xy(x=np.atleast_1d(x), y=np.atleast_1d(y), crs=crs),
-                data={data_column: np.atleast_1d(z)},
-            )
-        else:
-            data_column = None
-            gdf = gpd.GeoDataFrame(
-                geometry=gpd.points_from_xy(x=np.atleast_1d(x), y=np.atleast_1d(y), z=np.atleast_1d(z), crs=crs),
-            )
-
-        # If the data was transformed into boolean, re-initialize as a Mask subclass
-        # Typing: we can specify this behaviour in @overload once we add the NumPy plugin of MyPy
-        if np.atleast_1d(z)[0].dtype == bool:
-            return PointCloud(filename_or_dataset=gdf, data_column=data_column)  # type: ignore
-        # Otherwise, keep as a given PointCloudType subclass
-        else:
-            return cls(filename_or_dataset=gdf, data_column=data_column)
-
-    @classmethod
-    def from_array(cls, data: NDArrayNum, crs: CRS, data_column: str | None = None, use_z: bool = False) -> PointCloud:
-        """
-        Create point cloud from a 3 x N or N x 3 array of X coordinates, Y coordinates and Z values.
-
-        :param data: Point cloud coordinates and data values as 3 x N or N x 3 array.
-        :param crs: Coordinate reference system of point cloud.
-        :param data_column: Data column of point cloud.
-
-        :return Point cloud.
-        """
-
-        # Check shape
-        if data.ndim != 2 or (data.shape[0] != 3 and data.shape[1] != 3):
-            raise ValueError("Array must be of shape 3xN or Nx3.")
-
-        # Make the first axis the one with size 3
-        if data.shape[0] != 3:
-            data = data.T
-
-        return cls.from_xyz(x=data[0, :], y=data[1, :], z=data[2, :], crs=crs, data_column=data_column, use_z=use_z)
-
-    @classmethod
-    def from_tuples(
-        cls,
-        tuples_xyz: Iterable[tuple[Number, Number, Number]],
-        crs: CRS,
-        data_column: str | None = None,
-        use_z: bool = False,
-    ) -> PointCloud:
-        """
-        Create point cloud from an iterable of 3-tuples (X coordinate, Y coordinate, Z value).
-
-        :param tuples_xyz: Point cloud coordinates and data as an iterable of 3-tuples.
-        :param crs: Coordinate reference system of point cloud.
-        :param data_column: Data column of point cloud.
-
-        :return Point cloud.
-        """
-
-        return cls.from_array(np.array(tuples_xyz), crs=crs, data_column=data_column, use_z=use_z)
-
-    def to_xyz(self) -> tuple[NDArrayNum, NDArrayNum, NDArrayNum]:
-        """Convert point cloud to three 1D arrays of coordinates for X/Y/Z."""
-
-        return self.geometry.x.values, self.geometry.y.values, self.data
-
-    def to_array(self) -> NDArrayNum:
-        """Convert point cloud to a 3 x N array of X coordinates, Y coordinates and Z values."""
-
-        return np.stack((self.geometry.x.values, self.geometry.y.values, self.data), axis=0)
-
-    def to_tuples(self) -> Iterable[tuple[Number, Number, Number]]:
-        """Convert point cloud to a list of 3-tuples (X coordinate, Y coordinate, Z value)."""
-
-        return list(zip(self.geometry.x.values, self.geometry.y.values, self.data))
 
     def __getitem__(self, index: PointCloud | NDArrayBool | Any) -> PointCloud | Any:
         """
@@ -760,7 +588,7 @@ class PointCloud(Vector):  # type: ignore[misc]
                 ind = index  # type: ignore
             ind = ind.astype(bool)  # In case the 3D Z column was used, it can only be stored as floating
 
-            return PointCloud(self.ds.loc[ind], data_column=self.data_column)
+            return PointCloud(self.gdf.loc[ind], data_name=self.data_name)
 
         # Otherwise, use index and leave it to GeoPandas
         else:
@@ -784,11 +612,14 @@ class PointCloud(Vector):  # type: ignore[misc]
             # Assign
             if self._has_z:
                 new_geo = gpd.points_from_xy(
-                    x=self.geometry.x.values[ind], y=self.geometry.y.values[ind], z=assign, crs=self.crs
+                    x=self.geometry.x.values[ind],
+                    y=self.geometry.y.values[ind],
+                    z=assign,
+                    crs=self.crs,
                 )
-                self.ds.loc[ind, "geometry"] = new_geo
+                self.gdf.loc[ind, "geometry"] = new_geo
             else:
-                self.ds.loc[ind, [self.data_column]] = assign
+                self.gdf.loc[ind, [self.data_name]] = assign
 
         else:
             # Let the vector class do the job
@@ -798,7 +629,10 @@ class PointCloud(Vector):  # type: ignore[misc]
 
     def __array_ufunc__(
         self,
-        ufunc: Callable[[NDArrayNum | tuple[NDArrayNum, NDArrayNum]], NDArrayNum | tuple[NDArrayNum, NDArrayNum]],
+        ufunc: Callable[
+            [NDArrayNum | tuple[NDArrayNum, NDArrayNum]],
+            NDArrayNum | tuple[NDArrayNum, NDArrayNum],
+        ],
         method: str,
         *inputs: tuple[PointCloud]
         | tuple[PointCloud, PointCloud]
@@ -831,7 +665,6 @@ class PointCloud(Vector):  # type: ignore[misc]
 
         # If the universal function takes two inputs (Note: no ufunc exists that has three inputs or more)
         else:
-
             # Check the casting between Point cloud and array inputs, and return error messages if not consistent
 
             # Raise errors if necessary
@@ -864,7 +697,11 @@ class PointCloud(Vector):  # type: ignore[misc]
                 return self.copy(new_array=output[0]), self.copy(new_array=output[1])
 
     def __array_function__(
-        self, func: Callable[[NDArrayNum, Any], Any], types: tuple[type], args: Any, kwargs: Any
+        self,
+        func: Callable[[NDArrayNum, Any], Any],
+        types: tuple[type],
+        args: Any,
+        kwargs: Any,
     ) -> Any:
         """
         Method to cast NumPy array function directly on a Point cloud object by applying it to the masked array.
@@ -914,136 +751,6 @@ class PointCloud(Vector):  # type: ignore[misc]
         # Else, return outputs directly
         else:
             return outputs
-
-    def plot(  # type: ignore
-        self,
-        column: str | None = None,
-        ref_crs: RasterLike | VectorLike | CRS | int | None = None,
-        cmap: matplotlib.colors.Colormap | str | None = None,
-        vmin: float | int | None = None,
-        vmax: float | int | None = None,
-        alpha: float | int | None = None,
-        cbar_title: str | None = None,
-        add_cbar: bool = True,
-        ax: matplotlib.axes.Axes | Literal["new"] | None = None,
-        return_axes: bool = False,
-        savefig_fname: str | None = None,
-        **kwargs: Any,
-    ) -> None | tuple[matplotlib.axes.Axes, matplotlib.colors.Colormap]:
-        """
-        Plot the point cloud.
-
-        This method is a wrapper to geopandas.GeoDataFrame.plot. Any kwargs which
-        you give this method will be passed to it.
-
-        :param column: Column to plot. Default is the data column of the point cloud.
-        :param ref_crs: Coordinate reference system to match when plotting.
-        :param cmap: Colormap to use. Default is plt.rcParams['image.cmap'].
-        :param vmin: Colorbar minimum value. Default is data min.
-        :param vmax: Colorbar maximum value. Default is data max.
-        :param alpha: Transparency of raster and colorbar.
-        :param cbar_title: Colorbar label. Default is None.
-        :param add_cbar: Set to True to display a colorbar. Default is True if a "column" argument is passed.
-        :param ax: A figure ax to be used for plotting. If None, will plot on current axes. If "new",
-            will create a new axis.
-        :param return_axes: Whether to return axes.
-        :param savefig_fname: Path to quick save the output figure (previously created if an ax is give, new if not)
-            with a default DPI, no transparency and no metadata. Use `plt.savefig()` to specify other save
-            parameters or after other customizations. Warning: `plt.close()` or `plt.show()` still needs to be called
-            to close the figure.
-
-        :returns: None, or (ax, caxes) if return_axes is True
-        """
-
-        matplotlib = import_optional("matplotlib")
-        import matplotlib.pyplot as plt
-        from mpl_toolkits.axes_grid1 import make_axes_locatable
-
-        # Ensure that the vector is in the same crs as a reference
-        if has_geo_attr(ref_crs, "crs"):
-            crs = get_geo_attr(ref_crs, "crs")
-            vect_reproj = self.reproject(ref=crs)
-        elif isinstance(ref_crs, (CRS, int)):
-            vect_reproj = self.reproject(crs=ref_crs)
-        else:
-            vect_reproj = self
-
-        if column is None:
-            column = self.data_column
-
-        # Create axes, or get current ones by default (like in matplotlib)
-        if ax is None:
-            ax0 = plt.gca()
-        elif isinstance(ax, str) and ax.lower() == "new":
-            _, ax0 = plt.subplots()
-        elif isinstance(ax, matplotlib.axes.Axes):
-            ax0 = ax
-        else:
-            raise ValueError("ax must be a matplotlib.axes.Axes instance, 'new' or None.")
-
-        # Set add_cbar depending on column argument
-        if add_cbar:
-            add_cbar = True
-        else:
-            add_cbar = False
-
-        # Update with this function's arguments
-        if add_cbar:
-            legend = True
-        else:
-            legend = False
-
-        if "legend" in list(kwargs.keys()):
-            legend = kwargs.pop("legend")
-
-        # Get colormap arguments that might have been passed in the keyword args
-        if "legend_kwds" in list(kwargs.keys()) and legend:
-            legend_kwds = kwargs.pop("legend_kwds")
-            if cbar_title is not None:
-                legend_kwds.update({"label": cbar_title})  # Pad updates depending on figsize during plot,
-        else:
-            if cbar_title is not None:
-                legend_kwds = {"label": cbar_title}
-            else:
-                legend_kwds = None
-
-        # Add colorbar
-        if add_cbar or cbar_title:
-            divider = make_axes_locatable(ax0)
-            cax = divider.append_axes("right", size="5%", pad="2%")
-            norm = matplotlib.colors.Normalize(vmin=vmin, vmax=vmax)
-            cbar = matplotlib.colorbar.ColorbarBase(
-                cax, cmap=cmap, norm=norm
-            )  # , orientation="horizontal", ticklocation="top")
-            cbar.solids.set_alpha(alpha)
-        else:
-            cax = None
-            cbar = None
-
-        # Plot
-        vect_reproj.ds.plot(
-            ax=ax0,
-            cax=cax,
-            column=column,
-            cmap=cmap,
-            vmin=vmin,
-            vmax=vmax,
-            alpha=alpha,
-            legend=legend,
-            legend_kwds=legend_kwds,
-            **kwargs,
-        )
-        plt.sca(ax0)
-
-        # if savefig_fname filled, save the plot
-        if savefig_fname:
-            plt.savefig(savefig_fname)
-
-        # If returning axes
-        if return_axes:
-            return ax0, cax
-        else:
-            return None
 
     def __add__(self: PointCloud, other: PointCloud | NDArrayNum | Number) -> PointCloud:
         """
@@ -1281,7 +988,9 @@ class PointCloud(Vector):  # type: ignore[misc]
     def __and__(self: PointCloud, other: PointCloud | NDArrayBool) -> PointCloud:
         """Bitwise and between masks, or a mask and an array."""
         other_data = _cast_numeric_array_pointcloud(
-            self, other, operation_name="an arithmetic operation"  # type: ignore
+            self,
+            other,
+            operation_name="an arithmetic operation",  # type: ignore
         )
 
         return self.copy(self.data & other_data)  # type: ignore
@@ -1295,7 +1004,9 @@ class PointCloud(Vector):  # type: ignore[misc]
         """Bitwise or between masks, or a mask and an array."""
 
         other_data = _cast_numeric_array_pointcloud(
-            self, other, operation_name="an arithmetic operation"  # type: ignore
+            self,
+            other,
+            operation_name="an arithmetic operation",  # type: ignore
         )
 
         return self.copy(self.data | other_data)  # type: ignore
@@ -1309,7 +1020,9 @@ class PointCloud(Vector):  # type: ignore[misc]
         """Bitwise xor between masks, or a mask and an array."""
 
         other_data = _cast_numeric_array_pointcloud(
-            self, other, operation_name="an arithmetic operation"  # type: ignore
+            self,
+            other,
+            operation_name="an arithmetic operation",  # type: ignore
         )
 
         return self.copy(self.data ^ other_data)  # type: ignore
@@ -1324,223 +1037,39 @@ class PointCloud(Vector):  # type: ignore[misc]
 
         return self.copy(~self.data)
 
-    def pointcloud_equal(self, other: PointCloud, **kwargs: Any) -> bool:
-        """
-        Check if two point clouds are equal.
-
-        This means that:
-        - The two vectors (geodataframes) are equal.
-        - The data column is the same for both point clouds.
-
-        Keyword arguments are passed to geopandas.assert_geodataframe_equal.
-        """
-
-        # Vector equality
-        vector_eq = super().vector_equal(other, **kwargs)
-        # Data column equality
-        data_column_eq = self.data_column == other.data_column
-
-        return all([vector_eq, data_column_eq])
-
-    def georeferenced_coords_equal(self: PointCloud, pc: PointCloud) -> bool:
-        """
-        Check that point cloud X/Y coordinates and CRS are equal.
-
-        :param pc: Another pointcloud.
-
-        :return: Whether the two objects have the same georeferenced points.
-        """
-
-        return all(
-            [
-                self.crs == pc.crs,
-                np.array_equal(self.geometry.x.values, pc.geometry.x.values),
-                np.array_equal(self.geometry.y.values, pc.geometry.y.values),
-            ]
-        )
+    @overload
+    def info(self, verbose: Literal[True] = ..., stats: bool = False) -> None: ...
 
     @overload
-    def get_stats(
-        self,
-        stats_name: str | Callable[[NDArrayNum], np.floating[Any]],
-    ) -> np.floating[Any]: ...
+    def info(self, verbose: Literal[False], stats: bool = False) -> str: ...
 
-    @overload
-    def get_stats(
-        self,
-        stats_name: list[str | Callable[[NDArrayNum], np.floating[Any]]] | None = None,
-    ) -> dict[str, np.floating[Any]]: ...
-
-    @profiler.profile("geoutils.pointcloud.pointcloud.get_stats", memprof=True)
-    def get_stats(
-        self,
-        stats_name: (
-            str | Callable[[NDArrayNum], np.floating[Any]] | list[str | Callable[[NDArrayNum], np.floating[Any]]] | None
-        ) = None,
-    ) -> np.floating[Any] | dict[str, np.floating[Any]]:
+    def info(self, verbose: bool = True, stats: bool = False) -> None | str:
         """
-        Retrieve specified statistics or all available statistics for the point cloud data. Allows passing custom
-        callables to calculate custom stats.
+        Print summary information about the point cloud.
 
-        Common statistics for an N-D array :
+        :param stats: Add statistics for each band of the dataset (max, min, median, mean, std. dev.). Default is to
+            not calculate statistics.
+        :param verbose: If set to True (default) will directly print to screen and return None
 
-        - Mean: arithmetic mean of the data, ignoring masked values.
-        - Median: middle value when the valid data points are sorted in increasing order, ignoring masked values.
-        - Max: maximum value among the data, ignoring masked values.
-        - Min: minimum value among the data, ignoring masked values.
-        - Sum: sum of all data, ignoring masked values.
-        - Sum of squares: sum of the squares of all data, ignoring masked values.
-        - 90th percentile: point below which 90% of the data falls, ignoring masked values.
-        - IQR (Interquartile Range): difference between the 75th and 25th percentile of a dataset,
-        ignoring masked values.
-        - LE90 (Linear Error with 90% confidence): difference between the 95th and 5th percentiles of a dataset,
-        representing the range within which 90% of the data points lie. Ignore masked values.
-        - NMAD (Normalized Median Absolute Deviation): robust measure of variability in the data, less sensitive to
-        outliers compared to standard deviation. Ignore masked values.
-        - RMSE (Root Mean Square Error): commonly used to express the magnitude of errors or variability and can give
-        insight into the spread of the data. Only relevant when the raster represents a difference of two objects.
-        Ignore masked values.
-        - Std (Standard deviation): measures the spread or dispersion of the data around the mean,
-        ignoring masked values.
-        - Valid count: number of finite data points in the array. It counts the non-masked elements.
-        - Total count: total size of the raster.
-        - Percentage valid points: ratio between Valid count and Total count.
-
-        For all statistics up to "Std", functions from numpy.ma module are used (directly or in the calculation) in case
-        of a masked array, numpy module otherwise.
-
-        "Valid count" represents all non zero and not masked pixels in the input data (final_count_nonzero).
-        Numpy Masked functions is used is this case or if the Point Cloud was already a masked array.
-        Percentage valid points is calculated accordingly.
-
-        If an inlier mask is passed:
-        - Total inlier count: number of data points in the inlier mask.
-        - Valid inlier count: number of unmasked data points in the array after applying the inlier mask.
-        - Percentage inlier points: ratio between Valid inlier count and Valid count. Useful for classification
-        statistics.
-        - Percentage valid inlier points: ratio between Valid inlier count and Total inlier count.
-
-        They are all computed based on the previously stated final_count_nonzero.
-
-        Callable functions are supported as well.
-
-        :param stats_name: Name or list of names of the statistics to retrieve. If None, all statistics are returned.
-            Accepted names include:
-            `mean`, `median`, `max`, `min`, `sum`, `sum of squares`, `90th percentile`, `LE90`, `nmad`, `rmse`,
-            `std`, `valid count`, `total count`, `percentage valid points` and if an inlier mask is passed :
-            `valid inlier count`, `total inlier count`, `percentage inlier point`, `percentage valid inlier points`.
-            Custom callables can also be provided.
-        :returns: The requested statistic or a dictionary of statistics if multiple or all are requested.
+        :returns: Summary string or None.
         """
 
-        # Force load if not loaded
-        if not self.is_loaded:
-            self.load()
+        # Get vector.info()
+        as_str_split = super().info(verbose=False).split("\n")  # type: ignore
 
-        data = self.data
+        if stats:
+            as_str_split.append("\nStatistics:")
+            statistics = self.stats()
 
-        # Given list or all attributes to compute if None
-        if isinstance(stats_name, list) or stats_name is None:
-            return _statistics(data, stats_name)  # type: ignore
+            # Determine the maximum length of the stat names for alignment
+            max_len = max(len(name) for name in statistics.keys())
+
+            # Format the stats with aligned names
+            for name, value in statistics.items():
+                as_str_split.append(f"{name.ljust(max_len)}: {value:.2f}")
+
+        if verbose:
+            print("\n".join(as_str_split))
+            return None
         else:
-            # Single attribute to compute
-            if isinstance(stats_name, str):
-                return _statistics(data, [stats_name])[stats_name]  # type: ignore
-            elif callable(stats_name):
-                return stats_name(data)  # type: ignore
-            else:
-                logging.warning("Statistic name '%s' is a not recognized string", stats_name)
-
-    @overload
-    def subsample(
-        self,
-        subsample: int | float,
-        return_indices: Literal[False] = False,
-        *,
-        random_state: int | np.random.Generator | None = None,
-    ) -> NDArrayNum: ...
-
-    @overload
-    def subsample(
-        self,
-        subsample: int | float,
-        return_indices: Literal[True],
-        *,
-        random_state: int | np.random.Generator | None = None,
-    ) -> tuple[NDArrayNum, ...]: ...
-
-    @overload
-    def subsample(
-        self,
-        subsample: float | int,
-        return_indices: bool = False,
-        random_state: int | np.random.Generator | None = None,
-    ) -> NDArrayNum | tuple[NDArrayNum, ...]: ...
-
-    @profiler.profile("geoutils.pointcloud.pointcloud.subsample", memprof=True)
-    def subsample(
-        self,
-        subsample: float | int,
-        return_indices: bool = False,
-        random_state: int | np.random.Generator | None = None,
-    ) -> NDArrayNum | tuple[NDArrayNum, ...]:
-        """
-        Randomly sample the point cloud. Only valid values are considered.
-
-        :param subsample: Subsample size. If <= 1, a fraction of the total pixels to extract.
-            If > 1, the number of pixels.
-        :param return_indices: Whether to return the extracted indices only.
-        :param random_state: Random state or seed number.
-
-        :return: Array of sampled valid values, or array of sampled indices.
-        """
-
-        return subsample_array(
-            array=self.data, subsample=subsample, return_indices=return_indices, random_state=random_state
-        )
-
-    @profiler.profile("geoutils.pointcloud.pointcloud.grid", memprof=True)
-    def grid(
-        self,
-        ref: RasterType | None = None,
-        grid_coords: tuple[NDArrayNum, NDArrayNum] | None = None,
-        res: float | tuple[float, float] | None = None,
-        shape: tuple[int, int] | None = None,
-        bounds: tuple[float, float, float, float] | BoundingBox | None = None,
-        resampling: Literal["nearest", "linear", "cubic"] = "linear",
-        dist_nodata_pixel: float = 1.0,
-        nodata: int | float = -9999,
-    ) -> RasterType:
-        """
-        Grid point cloud into a raster.
-
-        Output grid can be defined either by passing a reference raster to match, or by passing output grid coordinates
-        for X/Y (must be regular in each dimension), or by specifying an output grid resolution (which uses the
-        upper-left bounds of point cloud to define the start of the grid).
-
-        :param ref: Reference raster to match (if output grid coordinates or output resolution undefined).
-        :param grid_coords: Output grid coordinates in X and Y (if reference raster or output resolution undefined).
-        :param res: Output resolution (if reference raster or output grid coordinates undefined).
-        :param resampling: Resampling method within delauney triangles (defaults to linear).
-        :param dist_nodata_pixel: Distance from the point cloud after which grid cells are filled by nodata values,
-            expressed in number of pixels.
-        :param nodata: Nodata value of output raster (defaults to -9999).
-
-        :return: Raster from gridded point cloud.
-        """
-
-        out_shape, out_transform, out_crs = _check_match_grid(
-            self, ref=ref, coords=grid_coords, res=res, bounds=bounds, shape=shape, crs=None
-        )
-        grid_coords = _coords(transform=out_transform, shape=out_shape, grid=False, area_or_point=None)
-
-        array, transform = _grid_pointcloud(
-            self.ds,
-            grid_coords=grid_coords,
-            data_column_name=self.data_column,
-            resampling=resampling,
-            dist_nodata_pixel=dist_nodata_pixel,
-        )
-        from geoutils.raster import Raster  # Runtime import to avoid circularity issues
-
-        return Raster.from_array(data=array, transform=transform, crs=self.crs, nodata=nodata)
+            return "\n".join(as_str_split)

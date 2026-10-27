@@ -16,16 +16,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from geoutils.raster.raster import Raster, RasterType, handled_array_funcs  # noqa isort:skip
 from geoutils.raster.array import *  # noqa
-from geoutils.raster.distributed_computing import *  # noqa
-from geoutils.raster.georeferencing import *  # noqa
-from geoutils.raster.geotransformations import *  # noqa
+from geoutils.raster.base import RasterBase  # noqa
+from geoutils.raster.constructors import from_array  # noqa
 from geoutils.raster.multiraster import *  # noqa
 
 # To-be-deprecated
 from geoutils.raster.raster import Mask  # noqa
+from geoutils.raster.referencing import *  # noqa
 from geoutils.raster.satimg import *  # noqa
 from geoutils.raster.tiling import *  # noqa
+from geoutils.raster.transformation import *  # noqa
 
-__all__ = ["RasterType", "Raster"]
+from geoutils.raster.raster import Raster, RasterType, handled_array_funcs  # noqa isort:skip
+from geoutils.raster.xr_accessor import open_raster  # noqa isort:skip
+from geoutils.raster.xr_accessor import DataArrayRasterAccessor  # noqa isort:skip
+from geoutils.raster.xr_accessor import DatasetRasterAccessor  # noqa isort:skip
+
+
+__all__ = ["Raster", "DataArrayRasterAccessor", "DatasetRasterAccessor", "RasterType", "open_raster", "from_array"]

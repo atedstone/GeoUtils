@@ -5,7 +5,7 @@ dependencies:
   - python>=3.10,<3.15
 
   # Required dependencies
-  - geopandas>=0.12.0
+  - geopandas>=1.1
   - rasterio>=1.3
   - scipy=1.*
   - xarray>2023
@@ -13,37 +13,58 @@ dependencies:
 
   # Depend on the above
   - pyproj=3.*
-  - pandas>=1,<3
+  - pandas>=1,<4
   - numpy>=1,<3
   - affine
-  - shapely
+  - shapely>=2.0
   - pyogrio
 
   # Development-specific, to mirror manually in setup.cfg [options.extras_require].
   - pip
 
   # Optional dependencies
-  - matplotlib=3.* # For plotting
+
+  # Cloud
+  - fsspec # For remote point cloud files
+  - aiohttp # For HTTP range reads
+  - s3fs # For S3 point cloud files
+
+  # I/O
+  - pyarrow>=14 # For GeoParquet support
   - laspy # For LAS file support
   - lazrs-python # For LAZ file support
+  - netcdf4
+  - zarr
+
+  # Parallel
+  - dask # For out-of-memory operations
+  - distributed # For distributed Dask execution and profiling
+  - dask-geopandas # For out-of-memory vector/point operations
+
+  # Numerics
+  - numba # For filters and point cloud gridding
+  - flox # For grouped statistics
+  - exactextract>=0.3 # For fast exact polygon-cell coverage
+
+  # Plotting
+  - matplotlib=3.* # For plotting
+
+  # Profiling
   - psutil # For profiler
   - plotly # For profiler
-  - numba # For filters
-  - dask # For out-of-memory operations
 
   # Test dependencies
-  - gdal  # To test functionalities against GDAL
-  - pytest=7.*
+  - gdal<3.13.3  # To benchmark functionalities against GDAL
+  - pdal>=2.10  # To benchmark functionalities against PDAL
+  - pytest>=8,<10
   - pytest-xdist
   - pytest-lazy-fixtures
   - pytest-instafail
   - pytest-socket
   - pytest-cov
+  - sybil>=9.3,<10
   - coveralls
   - pyyaml
-  - flake8
-  - netcdf4  # To write synthetic data with chunksizes
-  - pre-commit
 
   # Doc dependencies
   - sphinx
@@ -62,3 +83,8 @@ dependencies:
 
   - pip:
       - -e ./
+      # Geostats
+      - scikit-gstat>=1.0.23 # For variogram fitting
+      - gstools>=1.3 # For variogram conversion, kriging and random fields
+      - gpytorch>=1.11 # For Gaussian-process covariance conversion
+      - torch>=2 # GPyTorch backend (repeated here as not enforced in GPyTorch)

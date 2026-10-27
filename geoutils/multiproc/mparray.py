@@ -1,3 +1,4 @@
+# Copyright (c) 2026 GeoUtils developers
 # Copyright (c) 2025 Centre National d'Etudes Spatiales (CNES)
 #
 # This file is part of the GeoUtils project:
@@ -15,47 +16,97 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Module defining array and configuration routines for chunked operations with Multiprocessing."""
+
+"""Module defining chunked array operations with Multiprocessing."""
+
 from __future__ import annotations
 
 import logging
 import tempfile
 import warnings
+from collections.abc import Iterator
+from contextlib import contextmanager
+from numbers import Integral
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, overload
 
 import numpy as np
 import rasterio as rio
 
 from geoutils._dispatch import get_geo_attr, has_geo_attr
-from geoutils._misc import import_optional
+from geoutils._misc import deprecate, import_optional
 from geoutils._typing import NDArrayNum
+from geoutils.multiproc.chunked import ChunkSpec, normalize_chunks
 from geoutils.multiproc.cluster import AbstractCluster, ClusterGenerator
+from geoutils.projtools import _affine_matmul
 
 if TYPE_CHECKING:
+    from geoutils.raster.base import RasterBase
     from geoutils.raster.raster import Raster
+
+
+ChunkSize = int | tuple[int, int]
+
+
+def _validate_chunk_size(chunks: Any, argument_name: str = "chunks") -> ChunkSize:
+    """Validate a square or rectangular chunk size."""
+
+    type_error = f"Argument '{argument_name}' must be an integer or a tuple of two integers."
+    value_error = f"Argument '{argument_name}' must contain strictly positive integers."
+
+    def _validate_axis(axis_chunk: Any) -> int:
+        if isinstance(axis_chunk, bool) or not isinstance(axis_chunk, Integral):
+            raise TypeError(type_error)
+        axis_chunk = int(axis_chunk)
+        if axis_chunk <= 0:
+            raise ValueError(value_error)
+        return axis_chunk
+
+    if isinstance(chunks, tuple):
+        if len(chunks) != 2:
+            raise ValueError(f"Argument '{argument_name}' must define two axes.")
+        return _validate_axis(chunks[0]), _validate_axis(chunks[1])
+
+    return _validate_axis(chunks)
+
+
+def _split_chunk_size(chunks: ChunkSize) -> tuple[int, int]:
+    """Return a 2D ``(rows, cols)`` chunk-size tuple from a square or rectangular chunk size."""
+
+    chunks = _validate_chunk_size(chunks)
+    if isinstance(chunks, int):
+        return chunks, chunks
+    return chunks
 
 
 class MultiprocConfig:
     """
-    Configuration class for handling multiprocessing parameters in raster processing.
+    Configuration class for handling multiprocessing parameters in raster and point cloud processing.
 
     This class encapsulates settings related to multiprocessing, allowing users to specify
-    chunk size, output file, and an optional cluster for parallel processing.
+    chunks, output file, and an optional cluster for parallel processing.
     It is designed to be passed into functions that require multiprocessing capabilities.
     """
 
     def __init__(
-        self, chunk_size: int, outfile: str | None = None, driver: str = "GTiff", cluster: AbstractCluster | None = None
+        self,
+        chunks: ChunkSize,
+        outfile: str | None = None,
+        driver: str | None = None,
+        cluster: AbstractCluster | None = None,
     ):
         """
         Initialize the MultiprocConfig instance with multiprocessing settings.
 
-        :param chunk_size: The size of the chunks for splitting raster data.
+        :param chunks: The size of the chunks for splitting raster data. Pass an integer for square chunks, or a
+            ``(rows, cols)`` tuple for rectangular chunks. Point cloud operations use an integer number of points.
         :param outfile: The file path where the output will be written.
-        :param driver: Driver to write file with.
+        :param driver: Output format. None uses GeoTIFF for raster results. Point cloud file results infer LAS/LAZ or
+            GeoPackage from the output filename where supported, defaulting to GeoPackage when no extension is given.
         :param cluster: A cluster object for distributed computing, or None for sequential processing.
         """
-        self.chunk_size = chunk_size
+        self.chunks = _validate_chunk_size(chunks)
+        self._outfile_is_temporary = outfile is None
         if outfile is None:
             with tempfile.NamedTemporaryFile() as tmp:
                 self.outfile = tmp.name
@@ -69,7 +120,27 @@ class MultiprocConfig:
         self.cluster = cluster
 
     def copy(self) -> MultiprocConfig:
-        return MultiprocConfig(chunk_size=self.chunk_size, outfile=self.outfile, cluster=self.cluster)
+        """Copy this configuration, reserving a fresh path when the output is implicit."""
+
+        outfile = None if self._outfile_is_temporary else self.outfile
+        return MultiprocConfig(chunks=self.chunks, outfile=outfile, driver=self.driver, cluster=self.cluster)
+
+    @contextmanager
+    def temporary(self) -> Iterator[MultiprocConfig]:
+        """
+        Use a temporary output file while reusing this configuration's chunk sizes, driver and worker cluster.
+
+        Each context owns a separate directory for its output and any driver sidecar files. Keep the context open
+        while intermediate files are being read; leaving it removes the files without closing the shared cluster.
+
+        :returns: Context manager yielding a configuration with a unique output filename. The original
+            configuration remains unchanged, and temporary files are removed even when processing raises an error.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            yield MultiprocConfig(
+                chunks=self.chunks, outfile=str(Path(directory) / "output"), driver=self.driver, cluster=self.cluster
+            )
 
 
 def _generate_tiling_grid(
@@ -135,29 +206,63 @@ def _generate_tiling_grid(
 
 
 def compute_tiling(
-    tile_size: int,
+    tile_size: ChunkSize,
     raster_shape: tuple[int, int],
-    ref_shape: tuple[int, int],
+    ref_shape: tuple[int, int] | None = None,
     overlap: int = 0,
 ) -> NDArrayNum:
     """
     Compute the raster tiling grid to coregister raster by block.
 
-    :param tile_size: Size of each tile (square tiles).
+    :param tile_size: Size of each tile. Pass an integer for square tiles, or a ``(rows, cols)`` tuple for rectangular
+        tiles.
     :param raster_shape: Shape of the raster to determine tiling parameters.
-    :param ref_shape: The shape of another raster to coregister, use to validate the shape.
+    :param ref_shape: Shape of another raster to coregister, use for validation (optional).
     :param overlap: Size of overlap between tiles (optional).
     :return: tiling_grid (array of tile boundaries).
 
-    :raises ValueError: if overlap is negative.
-    :raises TypeError: if overlap is not an integer.
+    :raises ValueError: If overlap is negative.
+    :raises TypeError: If overlap is not an integer.
     """
-    if raster_shape != ref_shape:
+    if ref_shape is not None and raster_shape != ref_shape:
         raise Exception("Reference and secondary rasters do not have the same shape")
     row_max, col_max = raster_shape
+    row_split, col_split = _split_chunk_size(tile_size)
 
     # Generate tiling
-    tiling_grid = _generate_tiling_grid(0, 0, row_max, col_max, tile_size, tile_size, overlap=overlap)
+    tiling_grid = _generate_tiling_grid(0, 0, row_max, col_max, row_split, col_split, overlap=overlap)
+    return tiling_grid
+
+
+def block_bounds_from_chunks(chunks: ChunkSpec, shape: tuple[int, int], overlap: int = 0) -> NDArrayNum:
+    """
+    Build a 2D grid of block bounds from a Dask-like chunk specification.
+
+    :param chunks: Dask-like chunk specification.
+    :param shape: Array shape.
+    :param overlap: Size of overlap around each block.
+    :return: Array of block bounds ordered as ``[row_start, row_stop, col_start, col_stop]``.
+    """
+
+    if overlap < 0:
+        raise ValueError(f"Overlap negative : {overlap}, must be positive")
+    if not isinstance(overlap, int):
+        raise TypeError(f"Overlap : {overlap}, must be an integer")
+
+    normalized_chunks = normalize_chunks(chunks=chunks, shape=shape)
+    row_starts = np.asarray([0, *np.cumsum(normalized_chunks[0])])
+    col_starts = np.asarray([0, *np.cumsum(normalized_chunks[1])])
+    tiling_grid = np.zeros(shape=(len(normalized_chunks[0]), len(normalized_chunks[1]), 4), dtype=int)
+
+    for row in range(tiling_grid.shape[0]):
+        for col in range(tiling_grid.shape[1]):
+            tiling_grid[row, col] = [
+                max(int(row_starts[row]) - overlap, 0),
+                min(int(row_starts[row + 1]) + overlap, shape[0]),
+                max(int(col_starts[col]) - overlap, 0),
+                min(int(col_starts[col + 1]) + overlap, shape[1]),
+            ]
+
     return tiling_grid
 
 
@@ -173,8 +278,8 @@ def plot_tiling(raster: Raster, tiling_grid: NDArrayNum) -> None:
     ax, caxes = raster.plot(return_axes=True)
     for tile in tiling_grid.reshape(-1, 4):
         row_min, row_max, col_min, col_max = tile
-        x_min, y_min = raster.transform * (col_min, row_min)  # Bottom-left corner
-        x_max, y_max = raster.transform * (col_max, row_max)  # Top-right corne
+        x_min, y_min = _affine_matmul(raster.transform, (col_min, row_min))  # Bottom-left corner
+        x_max, y_max = _affine_matmul(raster.transform, (col_max, row_max))  # Top-right corne
         rect = mpl.patches.Rectangle(
             (x_min, y_min), x_max - x_min, y_max - y_min, edgecolor="red", facecolor="none", linewidth=1.5
         )
@@ -195,34 +300,50 @@ def _load_raster_tile(raster_unload: Raster, tile: NDArrayNum) -> Raster:
     return raster_tile
 
 
+def _add_tile_padding(raster_shape: tuple[int, int], tile: NDArrayNum, padding: int) -> NDArrayNum:
+    """Expand tile bounds by padding and clip them to the raster shape."""
+
+    if not isinstance(padding, int):
+        raise TypeError(f"Padding must be an integer, got {padding}.")
+    if padding < 0:
+        raise ValueError(f"Padding must be non-negative, got {padding}.")
+
+    # Expand each side independently because blocks at raster edges have asymmetric padding
+    padded_tile = np.asarray(tile).copy()
+    padded_tile[0] = max(int(tile[0]) - padding, 0)
+    padded_tile[1] = min(int(tile[1]) + padding, raster_shape[0])
+    padded_tile[2] = max(int(tile[2]) - padding, 0)
+    padded_tile[3] = min(int(tile[3]) + padding, raster_shape[1])
+
+    return padded_tile
+
+
 def _remove_tile_padding(raster_shape: tuple[int, int], raster_tile: Raster, tile: NDArrayNum, padding: int) -> None:
     """
-    Removes the padding added around tiles during map_overlap computation to prevent edge effects.
+    Remove padding from a processed tile while preserving its destination grid.
 
     :param raster_shape: The shape (height, width) of the raster from which tiles are extracted.
     :param raster_tile: The raster tile with possible padding that needs removal.
-    :param tile: The bounding box of the tile as [rowmin, rowmax, colmin, colmax].
+    :param tile: The destination bounds as [rowmin, rowmax, colmin, colmax].
     :param padding: The padding size to be removed from each side of the tile.
     """
-    # New bounding box dimensions after removing padding
-    colmin, rowmin, colmax, rowmax = 0, 0, raster_tile.width, raster_tile.height
+    # Locate the destination block within its edge-clipped padded block
+    padded_tile = _add_tile_padding(raster_shape, tile, padding)
+    rowmin = int(tile[0] - padded_tile[0])
+    colmin = int(tile[2] - padded_tile[2])
+    rowmax = rowmin + int(tile[1] - tile[0])
+    colmax = colmin + int(tile[3] - tile[2])
 
-    # Remove padding only if the tile is not at the DEM's edges
-    if tile[0] != 0:
-        tile[0] += padding
-        rowmin += padding
-    if tile[1] != raster_shape[0]:
-        tile[1] -= padding
-        rowmax -= padding
-    if tile[2] != 0:
-        tile[2] += padding
-        colmin += padding
-    if tile[3] != raster_shape[1]:
-        tile[3] -= padding
-        colmax -= padding
+    # Crop back to the destination block without changing its output bounds
+    cropped = raster_tile.icrop(bbox=(colmin, rowmin, colmax, rowmax))
+    assert cropped is not None
 
-    # Apply the new bounding box to crop the tile and remove the padding
-    raster_tile.icrop(bbox=(colmin, rowmin, colmax, rowmax), inplace=True)
+    # Update only pixel data and grid for loaded tiles so custom metadata survives the crop
+    if raster_tile.is_loaded:
+        raster_tile._data = cropped.data
+        raster_tile.transform = cropped.transform
+    else:
+        raster_tile.__dict__.update(cropped.__dict__)
 
 
 def _apply_func_block(
@@ -234,29 +355,32 @@ def _apply_func_block(
     **kwargs: Any,
 ) -> tuple[Any, NDArrayNum]:
     """
-    Apply a function to a specific tile of a raster, handling loading and padding.
+    Apply a function to a padded raster block and crop its Raster result to the destination bounds.
+
+    The destination bounds are expanded with _add_tile_padding() before _load_raster_tile() reads the source.
+    After func() runs, _remove_tile_padding() crops a Raster result back to the unchanged destination bounds.
 
     :param func: The function to apply to each tile.
     :param raster: The input raster.
-    :param tile: The bounding box of the tile as [xmin, xmax, ymin, ymax].
+    :param tile: The destination bounds as [rowmin, rowmax, colmin, colmax].
     :param depth: The padding size used to overlap tiles.
     :param args: Additional arguments to pass to the function being applied.
 
     :return: The processed tile and its bounding box.
     """
-    # Load raster tile
-    raster_tile = _load_raster_tile(raster, tile)
+    # Load the destination block with enough neighboring pixels for the operation
+    raster_shape = (raster.height, raster.width)
+    padded_tile = _add_tile_padding(raster_shape, tile, depth)
+    raster_tile = _load_raster_tile(raster, padded_tile)
 
     # Apply user-defined function to the tile
     result_tile = func(raster_tile, *args, **kwargs)
 
-    # Remove padding
-    # If raster
+    # Crop Raster results back to the destination block before they are returned or written
     if has_geo_attr(result_tile, "transform"):
-        _remove_tile_padding((raster.height, raster.width), result_tile, tile, depth)
-    # Else
+        _remove_tile_padding(raster_shape, result_tile, tile, depth)
     elif isinstance(result_tile, tuple) and has_geo_attr(result_tile[0], "transform"):
-        _remove_tile_padding((raster.height, raster.width), result_tile[0], tile, depth)
+        _remove_tile_padding(raster_shape, result_tile[0], tile, depth)
 
     # If the raster is a mask, convert to uint8 before saving and force nodata to 255
     if has_geo_attr(result_tile, "transform") and result_tile.is_mask:
@@ -266,33 +390,36 @@ def _apply_func_block(
     return result_tile, tile
 
 
-def map_overlap_multiproc_save(
+def map_overlap(
     func: Callable[..., Raster],
-    raster_path: str | Raster,
-    config: MultiprocConfig,
+    raster_path: str | RasterBase,
+    mp_config: MultiprocConfig,
     *args: Any,
     depth: int = 0,
     **kwargs: Any,
 ) -> Raster:
     """
-    Applies a function to raster tiles in parallel and saves the result to a file.
+    Apply a function to raster blocks in parallel and save the result to a file.
 
-    This function divides the input raster into overlapping tiles, processes them in parallel using
-    multiprocessing, and writes the processed results to an output raster file.
+    This mirrors Dask array's ``map_overlap`` naming but computes eagerly because multiprocessing
+    tasks cannot stay lazy in this backend.
 
     Use this function when `func` returns a :class:`geoutils.Raster`,
     as it ensures the processed data is written to `config.outfile`.
 
-    :param func: A function to apply to each raster tile. It must return a :class:`geoutils.Raster` object.
+    :param func: Function returning a Raster on the tile's grid. It may change the number of bands; every tile must
+        use the same output band count, dtype and nodata. Metadata comes from the first input tile's result.
     :param raster_path: Path to the input raster file or an existing :class:`geoutils.Raster` object.
-    :param config: Configuration object containing chunk size, output file path, and an optional cluster.
+    :param mp_config: Configuration object containing chunks, output file path, and an optional cluster.
         The `outfile` parameter in `config` must be provided.
     :param args: Additional positional arguments to pass to `func`.
-    :param depth: The overlap size between tiles to avoid edge effects, default is 0.
+    :param depth: The overlap size between blocks to avoid edge effects, default is 0.
     :param kwargs: Additional keyword arguments to pass to `func`.
 
+    :returns: File-backed raster with the output bands and metadata returned by func().
+
     :raises ValueError: If `config.outfile` is not provided.
-    :raises RuntimeError: If an error occurs while processing the raster tiles.
+    :raises RuntimeError: If an error occurs while processing the raster blocks.
     """
 
     # To avoid circular import, runtime here
@@ -304,32 +431,30 @@ def map_overlap_multiproc_save(
     else:
         raster = raster_path
 
-    # Generate tiling grid
-    tiling_grid = compute_tiling(config.chunk_size, raster.shape, raster.shape, overlap=depth)
+    # Generate non-overlapping destination blocks; each worker adds its own clipped padding
+    tiling_grid = compute_tiling(mp_config.chunks, raster.shape, raster.shape)
 
     # Create tasks for multiprocessing
     tasks = []
     for row in range(tiling_grid.shape[0]):
         for col in range(tiling_grid.shape[1]):
             tile = tiling_grid[row, col]
-            # Launch the task on the cluster to process each tile
-            tasks.append(
-                config.cluster.launch_task(fun=_apply_func_block, args=[func, raster, tile, depth, *args], **kwargs)
-            )
+            # Submit the block processing task on the cluster
+            tasks.append(mp_config.cluster.submit(_apply_func_block, func, raster, tile, depth, *args, **kwargs))
 
-    # get first tile to retrieve dtype and nodata
-    result_tile0, _ = config.cluster.get_res(tasks[0])
+    # Read the first result's band count and metadata because the function may change them
+    result_tile0, _ = mp_config.cluster.compute(tasks[0])
     file_metadata = {
         "width": raster.width,
         "height": raster.height,
-        "count": raster.count,
+        "count": result_tile0.count,
         "crs": raster.crs,
         "transform": raster.transform,
         "dtype": result_tile0.dtype,
         "nodata": result_tile0.nodata,
     }
 
-    raster_output = _write_multiproc_result(tasks, config, file_metadata)
+    raster_output = _write_multiproc_result(tasks, mp_config, file_metadata, tags=dict(result_tile0.tags))
 
     # Warns user if output file is a BigTIFF
     if raster_output._is_bigtiff():
@@ -343,19 +468,37 @@ def map_overlap_multiproc_save(
 
 def _write_multiproc_result(
     tasks: list[Any],
-    config: MultiprocConfig,
+    mp_config: MultiprocConfig,
     file_metadata: dict[str, Any],
+    *,
+    tags: dict[str, Any] | None = None,
 ) -> Raster:
+    """
+    Write completed worker tiles to their output windows without collecting the full raster in memory.
+
+    :param tasks: Worker results containing a Raster or NumPy tile and its row/column window boundaries.
+    :param mp_config: Worker cluster, output filename and driver, as described by map_overlap().
+    :param file_metadata: Rasterio output dimensions, band count, dtype, georeferencing and nodata.
+    :param tags: Optional output metadata, including AREA_OR_POINT when pixel interpretation is known. Rasterio
+        stores these as strings; the returned Raster keeps the supplied Python values.
+
+    :returns: File-backed Raster or mask with every completed tile written and its output metadata attached.
+    """
 
     # To avoid circular import, runtime here
     from geoutils.raster import Raster
 
     # Create a new raster file to save the processed results
-    with rio.open(config.outfile, "w", driver=config.driver, **file_metadata, BIGTIFF="IF_NEEDED") as dst:
+    with rio.open(
+        mp_config.outfile, "w", driver=mp_config.driver or "GTiff", **file_metadata, BIGTIFF="IF_NEEDED"
+    ) as dst:
+        # Preserve result metadata, including pixel interpretation, when the caller provides it
+        if tags is not None:
+            dst.update_tags(**tags)
         try:
-            # Iterate over the tasks and retrieve the processed tiles
-            for results in tasks:
-                result_tile, dst_tile = config.cluster.get_res(results)
+            # Retrieve completed blocks promptly so worker results can be released after writing
+            for task_index, completed in mp_config.cluster.iter_completed(tasks):
+                result_tile, dst_tile = completed
                 is_mask = has_geo_attr(result_tile, "is_mask") and get_geo_attr(result_tile, "is_mask")
 
                 # Define the window in the output file where the tile should be written
@@ -373,72 +516,93 @@ def _write_multiproc_result(
                 else:
                     data = result_tile.data if result_tile.count > 1 else result_tile[np.newaxis, :, :]
 
-                # Write the processed tile to the appropriate location in the output file
+                # Write the processed block to the appropriate location in the output file
                 dst.write(data, window=dst_window)
-            logging.info(f"Raster saved under {config.outfile}")
-        except Exception as e:
-            raise RuntimeError(f"Error retrieving raster tiles from multiprocessing tasks: {e}")
 
-    if is_mask:
-        return Raster(config.outfile, as_mask=True)
-    return Raster(config.outfile)
+                # Futures retain their result, so release both after the file owns the tile
+                tasks[task_index] = None
+                del data
+                del result_tile
+            logging.info(f"Raster saved under {mp_config.outfile}")
+        except Exception as e:
+            raise RuntimeError(f"Error retrieving raster blocks from multiprocessing tasks: {e}")
+
+    # Keep metadata types such as band-name tuples on the returned object after the normal file metadata read
+    output = Raster(mp_config.outfile, is_mask=is_mask)
+    if tags is not None:
+        output.tags.update(tags)
+    return output
 
 
 @overload
-def map_multiproc_collect(
+def map_collect(
     func: Callable[..., Any],
-    raster_path: str | Any,
-    config: MultiprocConfig,
+    raster_path: str | RasterBase,
+    mp_config: MultiprocConfig,
     *args: Any,
     depth: int = 0,
-    return_tile: Literal[True],
+    return_block_info: Literal[True],
     **kwargs: Any,
 ) -> list[tuple[Any, NDArrayNum]]: ...
 
 
 @overload
-def map_multiproc_collect(
+def map_collect(
     func: Callable[..., Any],
-    raster_path: str | Any,
-    config: MultiprocConfig,
+    raster_path: str | RasterBase,
+    mp_config: MultiprocConfig,
     *args: Any,
     depth: int = 0,
-    return_tile: Literal[False] = False,
+    return_block_info: Literal[False] = False,
     **kwargs: Any,
 ) -> list[Any]: ...
 
 
-def map_multiproc_collect(
+@overload
+def map_collect(
     func: Callable[..., Any],
-    raster_path: str | Raster,
-    config: MultiprocConfig,
+    raster_path: str | RasterBase,
+    mp_config: MultiprocConfig,
     *args: Any,
     depth: int = 0,
-    return_tile: bool = False,
+    return_block_info: bool,
+    **kwargs: Any,
+) -> list[Any] | list[tuple[Any, NDArrayNum]]: ...
+
+
+def map_collect(
+    func: Callable[..., Any],
+    raster_path: str | RasterBase,
+    mp_config: MultiprocConfig,
+    *args: Any,
+    depth: int = 0,
+    return_block_info: bool = False,
     **kwargs: Any,
 ) -> list[Any] | list[tuple[Any, NDArrayNum]]:
     """
-    Applies a function to raster tiles in parallel and collects the results into a list.
+    Apply a function to raster blocks in parallel and collect the results into a list.
 
-    This function splits an input raster into overlapping tiles, processes them in parallel,
+    This function splits an input raster into overlapping blocks, processes them in parallel,
     and returns the results as a list. It is intended for cases where `func` does *not* return
     a :class:`geoutils.Raster`, but instead returns arbitrary values (e.g., numerical statistics, feature
     extractions, etc.).
 
-    If `return_tile=True`, the function returns a list of tuples, where each tuple contains
-    the computed result and the corresponding tile indices.
+    If `return_block_info=True`, the function returns a list of tuples, where each tuple contains
+    the computed result and the corresponding block indices.
 
-    :param func: A function to apply to each raster tile. It should return any type *except* :class:`geoutils.Raster`.
+    For a raster transformation written to disk, use map_overlap() with depth=0.
+
+    :param func: A function to apply to each raster block. It should return any type *except* :class:`geoutils.Raster`.
     :param raster_path: Path to the input raster file or an existing :class:`geoutils.Raster` object.
-    :param config: Configuration object containing chunk size, output file path, and an optional cluster.
+    :param mp_config: Configuration object containing chunks, output file path, and an optional cluster.
     :param args: Additional positional arguments to pass to `func`.
-    :param depth: The overlap size between tiles to avoid edge effects.
-    :param return_tile: If `True`, the output includes the tile indices in addition to the results.
+    :param depth: The overlap size between blocks to avoid edge effects.
+    :param return_block_info: If `True`, the output includes the block indices in addition to the results.
     :param kwargs: Additional keyword arguments to pass to `func`.
 
     :returns:
-        - `list[Any]` if `return_tile=False` (default).
-        - `list[tuple[Any, NDArrayNum]]` if `return_tile=True`.
+        - `list[Any]` if `return_block_info=False` (default).
+        - `list[tuple[Any, NDArrayNum]]` if `return_block_info=True`.
 
     :raises RuntimeError: If an error occurs while processing the raster tiles.
     """
@@ -451,25 +615,23 @@ def map_multiproc_collect(
     else:
         raster = raster_path
 
-    # Generate tiling grid
-    tiling_grid = compute_tiling(config.chunk_size, raster.shape, raster.shape, overlap=depth)
+    # Generate non-overlapping destination blocks; each worker adds its own clipped padding
+    tiling_grid = compute_tiling(mp_config.chunks, raster.shape, raster.shape)
 
     # Create tasks for multiprocessing
     tasks = []
     for row in range(tiling_grid.shape[0]):
         for col in range(tiling_grid.shape[1]):
             tile = tiling_grid[row, col]
-            # Launch the task on the cluster to process each tile
-            tasks.append(
-                config.cluster.launch_task(fun=_apply_func_block, args=[func, raster, tile, depth, *args], **kwargs)
-            )
+            # Submit the block processing task on the cluster
+            tasks.append(mp_config.cluster.submit(_apply_func_block, func, raster, tile, depth, *args, **kwargs))
 
     try:
         list_results = []
         # Iterate over the tasks and retrieve the processed tiles
         for results in tasks:
-            result, dst_tile = config.cluster.get_res(results)
-            if return_tile:
+            result, dst_tile = mp_config.cluster.compute(results)
+            if return_block_info:
                 list_results.append((result, dst_tile))
             else:
                 list_results.append(result)
@@ -477,3 +639,40 @@ def map_multiproc_collect(
 
     except Exception as e:
         raise RuntimeError(f"Error retrieving raster from multiprocessing tasks: {e}")
+
+
+@deprecate(details="Use map_overlap() instead.")
+def map_overlap_multiproc_save(
+    func: Callable[..., Raster],
+    raster_path: str | RasterBase,
+    mp_config: MultiprocConfig,
+    *args: Any,
+    depth: int = 0,
+    **kwargs: Any,
+) -> Raster:
+    """Compatibility wrapper for the former multiprocessing map name."""
+
+    return map_overlap(func, raster_path, mp_config, *args, depth=depth, **kwargs)
+
+
+@deprecate(details="Use map_collect() with return_block_info instead.")
+def map_multiproc_collect(
+    func: Callable[..., Any],
+    raster_path: str | RasterBase,
+    mp_config: MultiprocConfig,
+    *args: Any,
+    depth: int = 0,
+    return_tile: bool = False,
+    **kwargs: Any,
+) -> list[Any] | list[tuple[Any, NDArrayNum]]:
+    """Compatibility wrapper for the former multiprocessing collection name."""
+
+    return map_collect(
+        func,
+        raster_path,
+        mp_config,
+        *args,
+        depth=depth,
+        return_block_info=return_tile,
+        **kwargs,
+    )

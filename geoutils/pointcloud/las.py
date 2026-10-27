@@ -1,0 +1,1568 @@
+# Copyright (c) 2026 GeoUtils developers
+#
+# This file is part of the GeoUtils project:
+# https://github.com/glaciohack/geoutils
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+#
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""LasPy support for GeoUtils point clouds and dataframe accessors."""
+
+# Summary: the module is separated in common helpers, readers and writers.
+
+# ``PointCloud.load()`` uses the in-memory or multiprocessing readers in this
+# module and returns one in-memory GeoDataFrame.
+# ``open_pointcloud(..., chunks=...)`` assembles a lazy Dask-GeoPandas GeoDataFrame in
+# ``pointcloud.loading``; each Dask partition calls the point-index slice
+# reader defined here.
+
+# Writing follows the reverse pattern. Common conversion helpers turn each
+# dataframe partition into LasPy records, backend-specific writers supply in-memory,
+# Dask, or multiprocessing partitions, and ``_write_laspy()`` dispatches between
+# those paths.
+
+from __future__ import annotations
+
+import os
+import pathlib
+import tempfile
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
+from functools import partial
+from typing import TYPE_CHECKING, Any, Literal
+
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import xarray as xr
+from pyproj import CRS
+from rasterio.coords import BoundingBox
+
+from geoutils._dispatch import is_dask_dataframe
+from geoutils._io import _get_filesystem, _path_suffix
+from geoutils._misc import import_optional
+
+if TYPE_CHECKING:
+    from laspy.copc import Entry
+
+    from geoutils.multiproc.mparray import MultiprocConfig
+
+
+#############################
+# 1/ SHARED LAS DEFINITIONS
+#############################
+
+# Metadata, bounds and dataframe conversion shared by all reading strategies
+###########################################################################
+
+
+@dataclass(frozen=True)
+class LasMetadata:
+    """Header metadata used to plan in-memory, multiprocessing and Dask reads."""
+
+    crs: CRS | None
+    point_count: int
+    bounds: BoundingBox
+    columns: pd.Index
+    is_copc: bool
+    point_record_size: int
+    laz_chunk_size: int | None
+
+
+def _is_laspy_supported(filename: str | pathlib.Path) -> bool:
+    """Return whether a filename looks like a LasPy-supported file."""
+
+    suffix = _path_suffix(filename)
+    return suffix in [".las", ".laz"]
+
+
+def _bounds_from_tuple(bounds: BoundingBox | Sequence[float]) -> BoundingBox:
+    """Convert a 4-value bounds-like object to a Rasterio BoundingBox."""
+
+    if isinstance(bounds, BoundingBox):
+        return bounds
+
+    if len(bounds) != 4:
+        raise ValueError("Bounds must contain four values: left, bottom, right and top.")
+
+    left, bottom, right, top = (float(value) for value in bounds)
+    if left > right:
+        raise ValueError("Bounds left coordinate must be smaller than or equal to right coordinate.")
+    if bottom > top:
+        raise ValueError("Bounds bottom coordinate must be smaller than or equal to top coordinate.")
+    return BoundingBox(left=left, bottom=bottom, right=right, top=top)
+
+
+def _spatial_bounds_grid(
+    bounds: BoundingBox | Sequence[float],
+    block_size: float | tuple[float, float],
+) -> list[BoundingBox]:
+    """
+    Split bounds into X/Y coordinate blocks.
+
+    :param bounds: Bounds to split as (left, bottom, right, top).
+    :param block_size: Block size in coordinate units, either a scalar
+        or ``(x_size, y_size)``.
+    :returns: List of bounds in row-major order from top-left to bottom-right.
+    """
+
+    # Normalize scalar and rectangular block sizes to separate X/Y values
+    bbox = _bounds_from_tuple(bounds)
+    if isinstance(block_size, tuple):
+        x_size, y_size = block_size
+    else:
+        x_size = y_size = block_size
+
+    if x_size <= 0 or y_size <= 0:
+        raise ValueError("Block sizes must be strictly positive.")
+
+    # Add the outer edge explicitly because the extent may not divide evenly
+    x_edges = list(np.arange(bbox.left, bbox.right, x_size)) + [bbox.right]
+    y_edges = list(np.arange(bbox.bottom, bbox.top, y_size)) + [bbox.top]
+    x_edges = sorted({float(edge) for edge in x_edges})
+    y_edges = sorted({float(edge) for edge in y_edges})
+
+    # Emit row-major blocks from the top-left, matching raster tile order
+    blocks = []
+    for y_min, y_max in zip(reversed(y_edges[:-1]), reversed(y_edges[1:])):
+        bottom = min(y_min, y_max)
+        top = max(y_min, y_max)
+        for left, right in zip(x_edges[:-1], x_edges[1:]):
+            blocks.append(BoundingBox(left=left, bottom=bottom, right=right, top=top))
+    return blocks
+
+
+def _resolve_las_columns(
+    columns: Literal["all", "main"] | Iterable[str],
+    data_name: str | None,
+    available_columns: pd.Index,
+) -> list[str]:
+    """Resolve requested LAS dimensions once for every downstream reader."""
+
+    # Expand public column shorthands before validating against the header
+    if isinstance(columns, str) and columns == "all":
+        columns_to_load = list(available_columns)
+    elif isinstance(columns, str) and columns == "main":
+        columns_to_load = [data_name] if data_name is not None else []
+    else:
+        columns_to_load = list(columns)
+
+    if "Z" not in columns_to_load:
+        columns_to_load = ["Z"] + columns_to_load
+
+    # Report all unknown dimensions together for a useful user-facing error
+    missing = [column for column in columns_to_load if column not in available_columns]
+    if missing:
+        raise ValueError(
+            f"Column(s) {', '.join(missing)} not found among LAS dimensions. "
+            "Available columns are: "
+            f"{', '.join(available_columns)}."
+        )
+
+    return columns_to_load
+
+
+def _empty_las_geodataframe(columns: list[str], crs: CRS | None) -> gpd.GeoDataFrame:
+    """Build the schema used by empty results and lazy Dask partitions."""
+
+    data = {column: pd.Series(dtype="float64") for column in columns}
+    empty = gpd.GeoDataFrame(data=data, geometry=gpd.GeoSeries([], crs=crs), crs=crs)
+    empty.attrs["crs"] = crs
+    return empty
+
+
+def _concat_las_geodataframes(parts: list[gpd.GeoDataFrame], columns: list[str], crs: CRS | None) -> gpd.GeoDataFrame:
+    """Combine in-memory LAS chunks while preserving their common schema and CRS."""
+
+    if len(parts) == 0:
+        return _empty_las_geodataframe(columns=columns, crs=crs)
+
+    return gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), geometry="geometry", crs=crs)
+
+
+def _laspy_points_to_geodataframe(points: Any, crs: CRS | None, columns: list[str]) -> gpd.GeoDataFrame:
+    """Convert one LasPy record batch for any in-memory or partitioned reader."""
+
+    # Keep Z as a data column while X/Y become two-dimensional point geometry
+    columns_no_z = [column for column in columns if column != "Z"]
+    data = {"Z": np.asarray(points.z)}
+    for column in columns_no_z:
+        data[column] = np.asarray(points[column])
+
+    return gpd.GeoDataFrame(
+        data=data,
+        geometry=gpd.points_from_xy(x=points.x, y=points.y, crs=crs),
+        columns=["Z"] + columns_no_z + ["geometry"],
+        crs=crs,
+    )
+
+
+def _point_bounds_mask(
+    x: Any,
+    y: Any,
+    bounds: BoundingBox | Sequence[float],
+    *,
+    include_right: bool = True,
+    include_top: bool = True,
+) -> Any:
+    """Build a boolean mask selecting points within X/Y bounds."""
+
+    # Inclusive outer edges retain dataset boundaries while internal tile edges can be exclusive
+    bbox = _bounds_from_tuple(bounds)
+    right_mask = x <= bbox.right if include_right else x < bbox.right
+    top_mask = y <= bbox.top if include_top else y < bbox.top
+    mask = (x >= bbox.left) & right_mask
+    mask &= (y >= bbox.bottom) & top_mask
+    return mask
+
+
+##################
+# 2/ LAS READING
+##################
+
+# Header, in-memory and point-index readers
+########################################
+
+
+@contextmanager
+def _open_las_reader(filename: str | pathlib.Path, *, copc: bool = False) -> Iterator[Any]:
+    """
+    Open a local or remote LAS/COPC file and close it after use.
+
+    LasPy can read from open files:
+    https://laspy.readthedocs.io/en/latest/api/index.html#laspy.open
+    https://laspy.readthedocs.io/en/latest/api/laspy.copc.html#laspy.copc.CopcReader
+    fsspec downloads remote data as needed:
+    https://filesystem-spec.readthedocs.io/en/latest/features.html#file-buffering-and-random-access.
+    """
+    laspy = import_optional("laspy")
+
+    filesystem = _get_filesystem(filename)
+    stream = (
+        open(filename, "rb") if filesystem is None else filesystem.open(os.fspath(filename), "rb", block_size=1024**2)
+    )
+    with stream:
+        reader = laspy.CopcReader(stream, close_fd=False) if copc else laspy.open(stream, closefd=False)
+        with reader:
+            yield reader
+
+
+def _load_laspy_metadata(filename: str | pathlib.Path) -> LasMetadata:
+    """Read the header metadata needed to plan all LAS/LAZ loading paths."""
+
+    import_optional("laspy")
+    from laspy.copc import CopcInfoVlr
+
+    # Opening the reader gives access to the header without reading point records
+    with _open_las_reader(filename) as f:
+        crs = f.header.parse_crs(prefer_wkt=False)
+        point_count = f.header.point_count
+        bounds = BoundingBox(
+            left=f.header.x_min,
+            right=f.header.x_max,
+            bottom=f.header.y_min,
+            top=f.header.y_max,
+        )
+
+        # X and Y become geometry, leaving all remaining dimensions as dataframe columns
+        columns_names = list(f.header.point_format.dimension_names)
+        columns_names = [column for column in columns_names if column not in ["X", "Y"]]
+        columns = pd.Index(columns_names)
+        is_copc = any(isinstance(vlr, CopcInfoVlr) for vlr in f.header.vlrs)
+
+        # LASzip stores the block point count in bytes 12–15; 0xFFFFFFFF means variable block sizes
+        # Read the compression record directly so metadata inspection does not require a particular LAZ backend
+        point_record_size = f.header.point_format.size
+        laz_chunk_size = None
+        if f.header.are_points_compressed:
+            compression_data = f.header.vlrs.get("LasZipVlr")[0].record_data
+            block_size = int.from_bytes(compression_data[12:16], "little")
+            if block_size not in (0, 0xFFFFFFFF):
+                laz_chunk_size = block_size
+
+    return LasMetadata(
+        crs=crs,
+        point_count=point_count,
+        bounds=bounds,
+        columns=columns,
+        is_copc=is_copc,
+        point_record_size=point_record_size,
+        laz_chunk_size=laz_chunk_size,
+    )
+
+
+def _load_laspy_data(
+    filename: str | pathlib.Path,
+    columns: Literal["all", "main"] | Iterable[str],
+    data_name: str | None = "Z",
+) -> gpd.GeoDataFrame:
+    """Read all requested points into the in-memory GeoDataFrame used by ``PointCloud.load()``."""
+
+    # Validate requested dimensions before reading the complete file
+    metadata = _load_laspy_metadata(filename)
+    columns_to_load = _resolve_las_columns(
+        columns=columns,
+        data_name=data_name,
+        available_columns=metadata.columns,
+    )
+    # Convert all records only after column and metadata checks have passed
+    with _open_las_reader(filename) as reader:
+        las = reader.read()
+    return _laspy_points_to_geodataframe(points=las, crs=metadata.crs, columns=columns_to_load)
+
+
+def _load_laspy_data_slice(
+    filename: str | pathlib.Path,
+    columns: list[str],
+    start: int,
+    count: int,
+    copc_nodes: list[Entry] | None = None,
+) -> gpd.GeoDataFrame:
+    """Read one point-index slice for a Dask or multiprocessing partition."""
+
+    if start < 0:
+        raise ValueError("Slice start must be positive.")
+    if count < 0:
+        raise ValueError("Slice count must be positive.")
+
+    # Read the requested points from LAS or COPC
+    points, crs = _read_las_records(filename, start, count, copc_nodes)
+    return _laspy_points_to_geodataframe(points=points, crs=crs, columns=columns)
+
+
+# Array and GeoDataFrame opening
+################################
+
+
+def _read_copc_hierarchy(filename: str) -> list[Entry]:
+    """Read every COPC hierarchy page and return populated point groups in file order without reading points."""
+    import_optional("laspy")
+    from laspy.copc import HierarchyPage
+
+    # Read every index page to find point counts and file positions
+    entries: list[Entry] = []
+    with _open_las_reader(filename, copc=True) as reader:
+        pages = [reader.root_page]
+        while pages:
+            page = pages.pop()
+            for entry in page.entries.values():
+                if entry.point_count == -1:
+                    reader.source.seek(entry.offset)
+                    pages.append(HierarchyPage.from_bytes(reader.source.read(entry.byte_size)))
+                elif entry.point_count > 0:
+                    entries.append(entry)
+
+        # Check the total point count against the file header
+        if sum(entry.point_count for entry in entries) != reader.header.point_count:
+            raise ValueError("COPC hierarchy point count does not match the LAS header.")
+
+    # Sort by file position to match LasPy's point order
+    entries.sort(key=lambda entry: entry.offset)
+    return entries
+
+
+def _select_copc_nodes(
+    filename: str, level: int | range | None, target_count: int | None, *, nodes: list[Entry] | None = None
+) -> list[Entry]:
+    """
+    Select COPC point groups (nodes) in file order without reading their data.
+
+    Each point belongs to one level of detail. Level 0 is a coarse sample; higher levels add points.
+    Select requested levels, or add levels from the coarsest until there are at least target_count points.
+    Index format: https://copc.io/#hierarchy-page
+    Level selection: https://laspy.readthedocs.io/en/latest/api/laspy.copc.html#laspy.copc.CopcReader.query.
+
+    Pass nodes from _read_copc_hierarchy() to inspect available levels and select groups from the same index read.
+    """
+    # Treat an integer as one level
+    if isinstance(level, (int, np.integer)):
+        level = range(int(level), int(level) + 1)
+
+    # Reuse a supplied hierarchy so level metadata and selection share one index read
+    entries = _read_copc_hierarchy(filename) if nodes is None else nodes
+
+    # Count points by level for downsampling
+    if level is None and target_count is not None:
+        counts_by_level: dict[int, int] = {}
+        for entry in entries:
+            node_level = entry.key.level
+            counts_by_level[node_level] = counts_by_level.get(node_level, 0) + entry.point_count
+
+        # Add levels from coarse to fine until enough points are available
+        cumulative_count = 0
+        for selected_level in sorted(counts_by_level):
+            cumulative_count += counts_by_level[selected_level]
+            if cumulative_count >= target_count:
+                level = range(selected_level + 1)
+                break
+
+    if level is None:
+        return entries
+    return [entry for entry in entries if entry.key.level in level]
+
+
+def _read_las_records(
+    filename: str | pathlib.Path, start: int, count: int, copc_nodes: list[Entry] | None
+) -> tuple[Any, CRS | None]:
+    """
+    Read LAS rows or selected COPC groups, along with their CRS.
+
+    LasPy handles COPC reads and decompression:
+    https://github.com/laspy/laspy/blob/master/laspy/copc.py
+    """
+
+    # Read LAS rows
+    if copc_nodes is None or count == 0:
+        with _open_las_reader(filename) as reader:
+            crs = reader.header.parse_crs(prefer_wkt=False)
+            if count:
+                reader.seek(start)
+            return reader.read_points(count), crs
+
+    # Read whole COPC groups with LasPy
+    with _open_las_reader(filename, copc=True) as reader:
+        crs = reader.header.parse_crs(prefer_wkt=False)
+        points = reader._fetch_and_decompress_points_of_nodes(copc_nodes)
+    return points, crs
+
+
+def _read_las_arrays(
+    filename: str, columns: list[str], start: int, count: int, copc_nodes: list[Entry] | None = None
+) -> dict[str, Any]:
+    """Read one consecutive LAS record slice into separate numeric arrays."""
+
+    # Read points without creating geometry objects
+    points, _ = _read_las_records(filename, start, count, copc_nodes)
+
+    # Extract each native dimension separately so attributes preserve their original dtypes
+    arrays = {"x": np.asarray(points.x), "y": np.asarray(points.y)}
+    for name in columns:
+        arrays[name] = np.asarray(points.z if name == "Z" else points[name])
+    return arrays
+
+
+def _open_las_array(
+    filename: str,
+    data_name: str | None,
+    columns: Literal["all", "main"] | list[str],
+    chunks: int | None,
+    copc_nodes: list[Entry] | None = None,
+    *,
+    load: bool = True,
+) -> xr.DataArray:
+    """
+    Read LAS coordinates and attributes as in-memory arrays or delayed record slices.
+
+    _load_laspy_metadata() supplies row counts and dimensions. _read_las_arrays() reads each requested slice,
+    and from_xyz() assembles its values and coordinates without constructing geometries.
+    For COPC, _select_copc_nodes() chooses point groups for the chunks.
+    """
+    from geoutils.pointcloud.xr_accessor import DataArrayPointCloudAccessor
+
+    # Resolve native dimensions before reading records or constructing delayed slices
+    metadata = _load_laspy_metadata(filename)
+    data_name = data_name or "Z"
+    if data_name not in metadata.columns:
+        raise ValueError(f"Point data column {data_name!r} does not exist.")
+    selected = _resolve_las_columns(columns, data_name, metadata.columns)
+
+    # Select all levels by default for one complete point cloud
+    if metadata.is_copc and copc_nodes is None:
+        copc_nodes = _select_copc_nodes(filename, level=None, target_count=None)
+    point_count = metadata.point_count if copc_nodes is None else sum(node.point_count for node in copc_nodes)
+    empty = _read_las_arrays(filename, selected, 0, 0)
+
+    # We use Xarray to defer indexed file reads
+    if not load and chunks is None:
+        from geoutils.pointcloud.loading import _deferred_point_variable
+
+        arrays = {
+            name: _deferred_point_variable(
+                point_count, values.dtype, partial(_read_las_attribute, filename, name, copc_nodes)
+            )
+            for name, values in empty.items()
+        }
+    # Read points now, or let Dask load them later
+    elif chunks is None:
+        arrays = _read_las_arrays(filename, selected, 0, point_count, copc_nodes)
+    else:
+        dask = import_optional("dask")
+        import dask.array as da
+
+        # Read COPC groups whole, since they cannot be decompressed in parts
+        if copc_nodes is None:
+            lengths = [min(chunks, point_count - start) for start in range(0, point_count, chunks)]
+        else:
+            lengths = [node.point_count for node in copc_nodes]
+
+        # Share each read across coordinates and data values
+        parts = []
+        start = 0
+        for index, length in enumerate(lengths):
+            read_nodes = None if copc_nodes is None else [copc_nodes[index]]
+            parts.append(dask.delayed(_read_las_arrays)(filename, selected, start, length, read_nodes))
+            start += length
+
+        # Join arrays with their original data types and the requested chunk size
+        arrays = {}
+        for name, values in empty.items():
+            blocks = [
+                da.from_delayed(part[name], shape=(length,), dtype=values.dtype) for part, length in zip(parts, lengths)
+            ]
+            arrays[name] = da.concatenate(blocks).rechunk(chunks) if blocks else da.from_array(values, chunks=chunks)
+
+    # Construct one point DataArray from the selected values and separate coordinate arrays
+    result = DataArrayPointCloudAccessor.from_xyz(
+        arrays.pop("x"),
+        arrays.pop("y"),
+        arrays.pop(data_name),
+        metadata.crs,
+        data_name=data_name,
+        auxiliary=arrays,
+    )
+    return result
+
+
+def _read_las_attribute(filename: str, name: str, nodes: list[Entry] | None, start: int, count: int) -> Any:
+    """Read one attribute from consecutive LAS rows or the COPC nodes containing those rows."""
+    columns = [] if name in ("x", "y") else [name]
+    if nodes is None:
+        return _read_las_arrays(filename, columns, start, count)[name]
+
+    # COPC nodes decompress whole; discard nodes outside the selected row range first
+    selected = []
+    offset = 0
+    first = 0
+    for node in nodes:
+        if offset < start + count and offset + node.point_count > start:
+            if not selected:
+                first = offset
+            selected.append(node)
+        offset += node.point_count
+    values = _read_las_arrays(filename, columns, 0, count, selected)[name]
+    return values[start - first : start - first + count]
+
+
+def _load_laspy_data_slice_dataframe(
+    filename: str, columns: list[str], start: int, count: int, copc_nodes: list[Entry] | None = None
+) -> gpd.GeoDataFrame:
+    """Read points and assign row numbers starting at start."""
+
+    # Give every partition its source row range so indexes stay unique after assembly
+    ds = _load_laspy_data_slice(filename, columns, start, count, copc_nodes)
+    ds.index = pd.RangeIndex(start, start + count)
+    return ds
+
+
+def _open_las_geodataframe(
+    filename: str,
+    data_name: str | None,
+    columns: Literal["all", "main"] | list[str],
+    chunks: int | None,
+    copc_nodes: list[Entry] | None = None,
+) -> gpd.GeoDataFrame | Any:
+    """
+    Read LAS points as a GeoDataFrame, loading them now or in Dask chunks.
+
+    _load_laspy_metadata() reads the header; _select_copc_nodes() chooses COPC point groups.
+    _load_laspy_data_slice_dataframe() reads the points, and _build_pointcloud_output() adds bounds and point counts.
+    """
+    from geoutils.pointcloud.dataframe import (
+        _build_pointcloud_output,
+        _get_dataframe_attrs,
+        _import_dask_dataframe,
+        _set_dataframe_attrs,
+    )
+    from geoutils.pointcloud.pointcloud import PointCloud
+    from geoutils.vector.pd_accessor import _import_dask_geopandas
+
+    # Native LAS Z values are the default point-cloud data
+    if data_name is None:
+        data_name = "Z"
+
+    # Resolve requested dimensions entirely from the LAS header
+    metadata = _load_laspy_metadata(filename)
+    if data_name not in metadata.columns:
+        raise ValueError(
+            f"Data column {data_name} not found among columns. Available columns are: {', '.join(metadata.columns)}."
+        )
+    columns_to_load = _resolve_las_columns(
+        columns=columns,
+        data_name=data_name,
+        available_columns=metadata.columns,
+    )
+
+    # Select all levels by default for one complete point cloud
+    if metadata.is_copc and copc_nodes is None:
+        copc_nodes = _select_copc_nodes(filename, level=None, target_count=None)
+    point_count = metadata.point_count if copc_nodes is None else sum(node.point_count for node in copc_nodes)
+    if chunks is None and copc_nodes is not None:
+        # Read selected COPC points with their bounds and point count
+        frame = _load_laspy_data_slice_dataframe(filename, columns_to_load, 0, point_count, copc_nodes)
+        return _build_pointcloud_output(
+            frame,
+            data_name=data_name,
+            as_dataframe=True,
+            attrs={"bounds": metadata.bounds, "point_count": point_count},
+            preserve_locations=True,
+        )
+    if chunks is None:
+        # The in-memory path loads all requested LAS dimensions into one GeoDataFrame
+        pc = PointCloud(filename, data_name=data_name, downsample=1)
+        pc.load(columns=columns, mp_config=None)
+        pc._dataset.attrs["data_name"] = pc.data_name
+        return pc._dataset
+
+    # Load optional Dask components only for partitioned LAS output
+    dd = _import_dask_dataframe()
+    dgpd = _import_dask_geopandas()
+    dask = import_optional("dask")
+    delayed = dask.delayed
+
+    # Read COPC groups whole, then share each read across smaller chunks
+    if copc_nodes is None:
+        lengths = [min(chunks, point_count - start) for start in range(0, point_count, chunks)]
+    else:
+        lengths = [node.point_count for node in copc_nodes]
+
+    # Give rows unique numbers before splitting them into chunks
+    parts = []
+    start = 0
+    for index, length in enumerate(lengths):
+        read_nodes = None if copc_nodes is None else [copc_nodes[index]]
+        part = delayed(_load_laspy_data_slice_dataframe)(filename, columns_to_load, start, length, read_nodes)
+        for offset in range(0, length, chunks):
+            parts.append(part.iloc[offset : offset + chunks])
+        start += length
+
+    # Read zero records to preserve each native LAS dtype in Dask metadata and empty results
+    empty = _load_laspy_data_slice_dataframe(filename, columns_to_load, start=0, count=0)
+    if not parts:
+        parts = [delayed(_load_laspy_data_slice_dataframe)(filename, columns_to_load, start=0, count=0)]
+
+    # Keep LAS numeric dimensions unchanged while assembling the lazy dataframe
+    with dask.config.set({"dataframe.convert-string": False}):
+        ddf = dd.from_delayed(parts, meta=empty)
+
+    # Add geospatial behavior and cache header metadata for accessor properties
+    ddf = dgpd.from_dask_dataframe(ddf, geometry="geometry")
+    _set_dataframe_attrs(
+        ddf,
+        {
+            "crs": metadata.crs,
+            "bounds": metadata.bounds,
+            "point_count": point_count,
+            "data_name": data_name,
+            "geometry_type": "Point",
+        },
+    )
+    # Use the common output builder to add point metadata and the Dask ``.pc`` and ``.vct`` properties
+    pointcloud = _build_pointcloud_output(
+        ddf,
+        data_name=data_name,
+        as_dataframe=True,
+        attrs=_get_dataframe_attrs(ddf),
+        preserve_locations=True,
+    )
+    return pointcloud
+
+
+def _point_partition_size(mp_config: MultiprocConfig) -> int:
+    """Validate the row partition size shared by multiprocessing reads and writes."""
+
+    if not isinstance(mp_config.chunks, int):
+        raise ValueError("Point-cloud multiprocessing requires an integer chunk size.")
+    return mp_config.chunks
+
+
+def _load_laspy_data_partitions(
+    filename: str | pathlib.Path,
+    columns: list[str],
+    point_count: int,
+    partition_size: int,
+    mp_config: MultiprocConfig,
+) -> gpd.GeoDataFrame:
+    """Read point-index slices in workers and combine them into one in-memory GeoDataFrame."""
+
+    if partition_size <= 0:
+        raise ValueError("Argument 'partition_size' must be a strictly positive integer.")
+
+    # Split point indexes into independent ranges that workers can seek to directly
+    starts = list(range(0, point_count, partition_size))
+    futures = []
+    for start in starts:
+        count = min(partition_size, point_count - start)
+        futures.append(
+            mp_config.cluster.submit(
+                _load_laspy_data_slice,
+                filename,
+                columns,
+                start,
+                count,
+            )
+        )
+
+    # Gather in submission order so the combined point cloud keeps source row order
+    parts = mp_config.cluster.gather(futures)
+    crs = parts[0].crs if len(parts) > 0 else None
+    return _concat_las_geodataframes(parts=parts, columns=columns, crs=crs)
+
+
+# Sequential streaming and spatial selection
+##############################################
+
+
+def _iter_laspy_data_chunks(
+    filename: str | pathlib.Path,
+    columns: Literal["all", "main"] | list[str],
+    data_name: str | None = "Z",
+    chunk_size: int = 1_000_000,
+    bounds: BoundingBox | Sequence[float] | None = None,
+) -> Iterator[gpd.GeoDataFrame]:
+    """
+    Stream LAS/LAZ points as independent, in-memory GeoDataFrame chunks.
+
+    Regular LAS/LAZ files do not contain a spatial index, so bounded selection
+    streams through the file and filters points by coordinates. For COPC files,
+    use ``_load_laspy_data_bounds()`` with ``prefer_copc=True`` to use the
+    LasPy COPC spatial index. This iterator bounds memory but does not construct
+    a Dask-GeoPandas collection.
+    """
+
+    if chunk_size <= 0:
+        raise ValueError("Argument 'chunk_size' must be a strictly positive integer.")
+
+    # Resolve columns once before beginning the streaming read
+    metadata = _load_laspy_metadata(filename)
+    columns_to_load = _resolve_las_columns(
+        columns=columns,
+        data_name=data_name,
+        available_columns=metadata.columns,
+    )
+
+    # Yield each source chunk independently so callers control memory retention
+    with _open_las_reader(filename) as reader:
+        crs = reader.header.parse_crs(prefer_wkt=False)
+        for points in reader.chunk_iterator(chunk_size):
+            if bounds is not None:
+                # Copy scaled coordinates before applying an optional spatial filter
+                x = points.x.copy()
+                y = points.y.copy()
+                mask = _point_bounds_mask(x=x, y=y, bounds=bounds)
+                if not np.any(mask):
+                    continue
+                points = points[mask]
+
+            yield _laspy_points_to_geodataframe(points=points, crs=crs, columns=columns_to_load)
+
+
+def _load_laspy_data_bounds_copc(
+    filename: str | pathlib.Path,
+    columns: list[str],
+    bounds: BoundingBox | Sequence[float],
+) -> gpd.GeoDataFrame:
+    """Use the COPC spatial index for the indexed branch of bounded loading."""
+
+    laspy = import_optional("laspy")
+
+    # COPC can use its spatial index instead of scanning all point records
+    bbox = _bounds_from_tuple(bounds)
+    with _open_las_reader(filename, copc=True) as reader:
+        crs = reader.header.parse_crs(prefer_wkt=False)
+        query_bounds = laspy.Bounds(
+            mins=np.array([bbox.left, bbox.bottom]),
+            maxs=np.array([bbox.right, bbox.top]),
+        )
+        points = reader.spatial_query(query_bounds)
+
+    return _laspy_points_to_geodataframe(points=points, crs=crs, columns=columns)
+
+
+def _load_laspy_data_bounds(
+    filename: str | pathlib.Path,
+    columns: Literal["all", "main"] | list[str],
+    bounds: BoundingBox | Sequence[float],
+    data_name: str | None = "Z",
+    chunk_size: int = 1_000_000,
+    prefer_copc: bool = True,
+) -> gpd.GeoDataFrame:
+    """
+    Return one in-memory GeoDataFrame containing points within X/Y bounds.
+
+    COPC files are queried through LasPy's COPC spatial index when possible.
+    Normal LAS/LAZ files are streamed by point chunks and filtered by
+    coordinate masks before the matching chunks are concatenated.
+    """
+
+    metadata = _load_laspy_metadata(filename)
+    columns_to_load = _resolve_las_columns(
+        columns=columns,
+        data_name=data_name,
+        available_columns=metadata.columns,
+    )
+
+    # Use the indexed reader only when the header identifies COPC; errors from a COPC file must remain visible
+    if prefer_copc and metadata.is_copc:
+        return _load_laspy_data_bounds_copc(filename=filename, columns=columns_to_load, bounds=bounds)
+
+    # Stream, filter and combine bounded chunks for files without a spatial index
+    parts = list(
+        _iter_laspy_data_chunks(
+            filename=filename,
+            columns=columns_to_load,
+            data_name=data_name,
+            chunk_size=chunk_size,
+            bounds=bounds,
+        )
+    )
+    return _concat_las_geodataframes(parts=parts, columns=columns_to_load, crs=metadata.crs)
+
+
+def _iter_laspy_spatial_chunks(
+    filename: str | pathlib.Path,
+    block_bounds: Iterable[BoundingBox | Sequence[float]],
+    columns: Literal["all", "main"] | list[str],
+    data_name: str | None = "Z",
+    chunk_size: int = 1_000_000,
+) -> Iterator[tuple[int, BoundingBox, gpd.GeoDataFrame]]:
+    """
+    Read one LAS/LAZ stream and group its points into multiple X/Y blocks.
+
+    The source is read once, but matching rows are retained until all output
+    blocks can be returned. Adjacent blocks are left/bottom inclusive and
+    right/top exclusive, except on the dataset outer edge, avoiding duplicates
+    on tile boundaries for a non-overlapping block grid.
+    """
+
+    if chunk_size <= 0:
+        raise ValueError("Argument 'chunk_size' must be a strictly positive integer.")
+
+    metadata = _load_laspy_metadata(filename)
+    columns_to_load = _resolve_las_columns(
+        columns=columns,
+        data_name=data_name,
+        available_columns=metadata.columns,
+    )
+    # Materialize block definitions once because every source chunk visits them
+    blocks = [_bounds_from_tuple(bounds) for bounds in block_bounds]
+    if len(blocks) == 0:
+        return
+
+    # Accumulate only the matching point subsets for each requested spatial block
+    parts: list[list[gpd.GeoDataFrame]] = [[] for _ in blocks]
+    full_bounds = metadata.bounds
+
+    with _open_las_reader(filename) as reader:
+        crs = reader.header.parse_crs(prefer_wkt=False)
+        for points in reader.chunk_iterator(chunk_size):
+            # Convert scaled coordinates once per source chunk before checking blocks
+            x = points.x.copy()
+            y = points.y.copy()
+            for index, bounds in enumerate(blocks):
+                # Internal right/top edges are exclusive to prevent duplicate points
+                include_right = np.isclose(bounds.right, full_bounds.right)
+                include_top = np.isclose(bounds.top, full_bounds.top)
+                mask = _point_bounds_mask(
+                    x=x,
+                    y=y,
+                    bounds=bounds,
+                    include_right=include_right,
+                    include_top=include_top,
+                )
+                if np.any(mask):
+                    parts[index].append(
+                        _laspy_points_to_geodataframe(
+                            points=points[mask],
+                            crs=crs,
+                            columns=columns_to_load,
+                        )
+                    )
+
+    # Yield empty blocks too so output order always matches the requested grid
+    for index, bounds in enumerate(blocks):
+        yield index, bounds, _concat_las_geodataframes(parts=parts[index], columns=columns_to_load, crs=metadata.crs)
+
+
+##################
+# 3/ LAS WRITING
+##################
+
+# Shared header and dataframe-to-LasPy conversion
+##################################################
+
+
+def _as_geodataframe(pc: gpd.GeoDataFrame | pd.DataFrame, crs: CRS | None = None) -> gpd.GeoDataFrame:
+    """Normalize an in-memory writer partition to a GeoDataFrame with a CRS."""
+
+    if isinstance(pc, gpd.GeoDataFrame):
+        out = pc
+        if crs is not None and out.crs is None:
+            out = out.set_crs(crs)
+        return out
+
+    attrs = getattr(pc, "attrs", {})
+    pc_crs = crs if crs is not None else attrs.get("crs")
+    return gpd.GeoDataFrame(
+        pc,
+        geometry="geometry",
+        crs=pc_crs,
+    )
+
+
+def _iter_dataframe_partitions(
+    pc: gpd.GeoDataFrame | pd.DataFrame, partition_size: int | None
+) -> Iterator[gpd.GeoDataFrame]:
+    """Split an in-memory dataframe into row partitions for the common writer."""
+
+    if partition_size is None:
+        yield _as_geodataframe(pc)
+        return
+
+    if partition_size <= 0:
+        raise ValueError("Argument 'chunks' must be a strictly positive integer.")
+
+    for start in range(0, len(pc), partition_size):
+        yield _as_geodataframe(pc.iloc[start : start + partition_size])
+
+
+def _non_geometry_columns(pc: gpd.GeoDataFrame | pd.DataFrame) -> list[str]:
+    """Return dataframe columns except the geometry column."""
+
+    return [column for column in pc.columns if column != "geometry"]
+
+
+def _extra_las_columns(pc: gpd.GeoDataFrame | pd.DataFrame, data_name: str | None, header: Any) -> list[str]:
+    """Identify dataframe values that the shared header must store as extra dimensions."""
+
+    native_dimensions = set(header.point_format.dimension_names)
+    extra_columns = []
+    for column in _non_geometry_columns(pc):
+        if column == data_name:
+            continue
+        if column == "Z":
+            raise ValueError("Column 'Z' is reserved for the LAS native Z dimension.")
+        if column not in native_dimensions:
+            extra_columns.append(column)
+    return extra_columns
+
+
+def _build_laspy_header(
+    pc: gpd.GeoDataFrame | pd.DataFrame,
+    data_name: str | None,
+    version: Any = None,
+    point_format: Any = None,
+    offsets: tuple[float, float, float] | None = None,
+    scales: tuple[float, float, float] | None = None,
+    crs: CRS | None = None,
+    **kwargs: Any,
+) -> Any:
+    """Build the common LasPy header before selecting a writing backend."""
+
+    laspy = import_optional("laspy")
+
+    # Start with the requested LAS format, then apply coordinate encoding options
+    header = laspy.LasHeader(version=version, point_format=point_format)
+    if scales is not None:
+        header.scales = np.array(scales)
+    if offsets is not None:
+        header.offsets = np.array(offsets)
+    for key, value in kwargs.items():
+        setattr(header, key, value)
+
+    # Attach the point-cloud CRS when either the caller or dataframe provides one
+    pc = _as_geodataframe(pc, crs=crs)
+    header_crs = crs if crs is not None else pc.crs
+    if header_crs is not None:
+        header.add_crs(CRS.from_user_input(header_crs))
+
+    # Preserve non-native numeric attributes as LAS extra-byte dimensions
+    for column in _extra_las_columns(pc=pc, data_name=data_name, header=header):
+        dtype = pc[column].dtype
+        if not np.issubdtype(dtype, np.number) and not np.issubdtype(dtype, np.bool_):
+            raise TypeError(f"LAS extra dimension '{column}' must have a numeric or boolean dtype.")
+        header.add_extra_dim(laspy.ExtraBytesParams(name=column, type=dtype))
+
+    return header
+
+
+def _las_coordinate_bounds(dataframe: gpd.GeoDataFrame, elevation_column: str | None) -> np.ndarray[Any, Any] | None:
+    """Return finite X/Y/elevation bounds for one dataframe partition, or None when it is empty."""
+
+    if len(dataframe) == 0:
+        return None
+    elevation = dataframe[elevation_column].to_numpy() if elevation_column is not None else dataframe.geometry.z
+    coordinates = np.column_stack((dataframe.geometry.x, dataframe.geometry.y, elevation))
+    if not np.isfinite(coordinates).all():
+        raise ValueError("LAS and LAZ output requires finite X, Y and elevation values.")
+    return np.stack((coordinates.min(axis=0), coordinates.max(axis=0)))
+
+
+def _build_laspy_header_from_partitions(
+    partition_filenames: Sequence[str | pathlib.Path],
+    elevation_column: str | None,
+    partition_bounds: Sequence[np.ndarray[Any, Any] | None] | None = None,
+) -> Any:
+    """Build one LAS header from saved partition schemas and provided or scanned coordinate bounds."""
+
+    if len(partition_filenames) == 0:
+        raise ValueError("LAS output requires at least one saved partition.")
+    if partition_bounds is not None and len(partition_bounds) != len(partition_filenames):
+        raise ValueError("LAS partition bounds must match the saved partitions.")
+
+    # Read the first partition for its schema, then use worker bounds or scan every saved partition
+    first = pd.read_pickle(partition_filenames[0])
+    if partition_bounds is None:
+        partition_bounds = [
+            _las_coordinate_bounds(first if index == 0 else pd.read_pickle(filename), elevation_column)
+            for index, filename in enumerate(partition_filenames)
+        ]
+    finite_bounds = [bounds for bounds in partition_bounds if bounds is not None]
+
+    # Use millimeter precision for projected coordinates and elevation, and finer precision for geographic X/Y
+    crs = None if first.crs is None else CRS.from_user_input(first.crs)
+    scales = np.array([1e-8, 1e-8, 1e-3] if crs is not None and crs.is_geographic else [1e-3, 1e-3, 1e-3])
+    offsets = np.zeros(3)
+    if finite_bounds:
+        minimum = np.min([bounds[0] for bounds in finite_bounds], axis=0)
+        maximum = np.max([bounds[1] for bounds in finite_bounds], axis=0)
+        offsets = minimum + (maximum - minimum) / 2
+        required_scales = (maximum - minimum) / (2 * (np.iinfo(np.int32).max - 1))
+        scales = np.maximum(scales, required_scales)
+
+    return _build_laspy_header(
+        first,
+        data_name=elevation_column,
+        offsets=tuple(offsets),
+        scales=tuple(scales),
+        crs=crs,
+    )
+
+
+def _dataframe_to_lasdata(pc: gpd.GeoDataFrame | pd.DataFrame, data_name: str | None, header: Any) -> Any:
+    """Convert one in-memory dataframe partition to records for the shared LAS stream."""
+
+    laspy = import_optional("laspy")
+
+    # Reset point counts and bounds because they are recalculated for this partition
+    pc = _as_geodataframe(pc)
+    partition_header = header.copy()
+    partition_header.partial_reset()
+    las = laspy.LasData(partition_header)
+
+    # Map dataframe geometry and the selected value column to native LAS coordinates
+    las.x = pc.geometry.x.values
+    las.y = pc.geometry.y.values
+    if data_name is not None:
+        las.z = pc[data_name].values
+    else:
+        las.z = pc.geometry.z.values
+
+    # Copy all remaining attributes to their native or extra dimensions
+    for column in _non_geometry_columns(pc):
+        if column == data_name:
+            continue
+        if column == "Z":
+            continue
+        setattr(las, column, pc[column].values)
+
+    return las
+
+
+def _check_las_attributes(dataframe: gpd.GeoDataFrame, data_name: str | None, encoded: Any) -> None:
+    """Check that LAS dimension types preserve every non-coordinate dataframe value exactly."""
+
+    columns = [column for column in dataframe.columns if column not in (dataframe.geometry.name, data_name)]
+    for column in columns:
+        expected_values = dataframe[column].to_numpy()
+        encoded_values = np.asarray(encoded[column])
+
+        # Compare Python scalars so mixed numeric types do not hide integer rounding during NumPy promotion
+        equal_values = expected_values.astype(object) == encoded_values.astype(object)
+        equal_values |= pd.isna(expected_values) & pd.isna(encoded_values)
+        if not np.all(equal_values):
+            raise ValueError(f"LAS output cannot preserve the values in column {column!r} with its dimension type.")
+
+
+class _LazChunkBackend:
+    """Configure LasPy's Lazrs writer with a chosen number of points per disk chunk."""
+
+    def __init__(self, chunk_size: int) -> None:
+        """Store the validated number of points per compressed chunk."""
+        self.chunk_size = chunk_size
+
+    def is_available(self) -> bool:
+        """Report whether LasPy can use the Lazrs compressor."""
+        laspy = import_optional("laspy")
+        return bool(laspy.LazBackend.LazrsParallel.is_available())
+
+    def create_writer(self, destination: Any, header: Any) -> Any:
+        """Set the LASzip chunk size before LasPy writes the header or starts compression."""
+        laspy = import_optional("laspy")
+        lazrs = import_optional("lazrs")
+        writer = laspy.LazBackend.LazrsParallel.create_writer(destination, header)
+
+        # LASzip stores the point count per chunk as a little-endian integer in bytes 12–15
+        # Both the saved metadata and the compressor must receive the same updated record
+        compression_data = bytearray(writer.vlr.record_data())
+        compression_data[12:16] = self.chunk_size.to_bytes(4, "little")
+        writer.vlr = lazrs.LazVlr(bytes(compression_data))
+        return writer
+
+
+def _get_laz_write_backend(filename: str | pathlib.Path, laz_chunk_size: int | None) -> Any:
+    """Validate an optional LAZ disk chunk size and select its compressor before opening the output."""
+
+    if laz_chunk_size is None:
+        return None
+    if (
+        isinstance(laz_chunk_size, bool)
+        or not isinstance(laz_chunk_size, (int, np.integer))
+        or not 0 < laz_chunk_size < 0xFFFFFFFF
+    ):
+        raise ValueError("Argument 'laz_chunk_size' must be an integer between 1 and 4294967294.")
+    if _path_suffix(filename) != ".laz" or os.fspath(filename).lower().endswith(".copc.laz"):
+        raise ValueError("Argument 'laz_chunk_size' is only supported for LAZ output, not LAS or COPC.")
+
+    # Custom disk chunks use Lazrs; ordinary writes retain LasPy's default backend selection
+    import_optional("lazrs")
+    return _LazChunkBackend(int(laz_chunk_size))
+
+
+def _write_laspy_partitions(
+    filename: str | pathlib.Path,
+    partitions: Iterable[gpd.GeoDataFrame | pd.DataFrame],
+    data_name: str | None,
+    header: Any,
+    check_attributes: bool = False,
+    laz_chunk_size: int | None = None,
+) -> None:
+    """Append in-memory dataframe partitions from any backend to one LAS/LAZ stream."""
+
+    laspy = import_optional("laspy")
+
+    # Open one output stream and append each non-empty dataframe partition
+    write_header = header.copy()
+    write_header.partial_reset()
+    backend = _get_laz_write_backend(filename, laz_chunk_size)
+    with laspy.open(filename, mode="w", header=write_header, laz_backend=backend) as writer:
+        for part in partitions:
+            if len(part) == 0:
+                continue
+            dataframe = _as_geodataframe(part)
+            if check_attributes:
+                try:
+                    las = _dataframe_to_lasdata(pc=dataframe, data_name=data_name, header=header)
+                except OverflowError as error:
+                    raise ValueError(
+                        "LAS output cannot preserve point attributes with the selected dimension types."
+                    ) from error
+                _check_las_attributes(dataframe, data_name, las)
+            else:
+                las = _dataframe_to_lasdata(pc=dataframe, data_name=data_name, header=header)
+            writer.write_points(las.points)
+
+
+def _write_laspy_saved_partitions(
+    filename: str | pathlib.Path,
+    partition_filenames: Iterable[str | pathlib.Path],
+    data_name: str | None,
+    header: Any,
+    check_attributes: bool = False,
+) -> None:
+    """Read saved dataframe partitions one at a time and append them directly to one LAS/LAZ stream."""
+
+    partitions = (pd.read_pickle(partition_filename) for partition_filename in partition_filenames)
+    _write_laspy_partitions(
+        filename=filename,
+        partitions=partitions,
+        data_name=data_name,
+        header=header,
+        check_attributes=check_attributes,
+    )
+
+
+# Numeric array writer
+######################
+
+
+def _write_array_las(
+    points: xr.DataArray,
+    filename: str,
+    *,
+    chunks: int | None = None,
+    laz_chunk_size: int | None = None,
+    version: Any = None,
+    point_format: Any = None,
+    offsets: Any = None,
+    scales: Any = None,
+    **kwargs: Any,
+) -> None:
+    """Encode coordinate arrays and attributes into LAS records one row partition at a time."""
+    from geoutils.pointcloud.writing import _array_partitions
+
+    laspy = import_optional("laspy")
+    backend = _get_laz_write_backend(filename, laz_chunk_size)
+    header = laspy.LasHeader(version=version, point_format=point_format)
+    if scales is not None:
+        header.scales = np.asarray(scales)
+    if offsets is not None:
+        header.offsets = np.asarray(offsets)
+    for key, value in kwargs.items():
+        setattr(header, key, value)
+    if points.pc.crs is not None:
+        header.add_crs(points.pc.crs)
+
+    # LAS elevation follows native Z when present, otherwise the active values
+    elevation = "Z" if "Z" in points.pc.columns else points.pc.data_name
+    attribute_names = [name for name in points.pc.columns if name != elevation]
+    native = set(header.point_format.dimension_names)
+    for name in attribute_names:
+        values = points if name == points.name else points.coords[name]
+        if name not in native:
+            if not np.issubdtype(values.dtype, np.number) and values.dtype != bool:
+                raise TypeError(f"LAS extra dimension {name!r} must have a numeric or boolean dtype.")
+            dtype = np.uint8 if values.dtype == bool else values.dtype
+            header.add_extra_dim(laspy.ExtraBytesParams(name=name, type=dtype))
+
+    # Finish the entire stream before replacing an existing destination
+    destination = pathlib.Path(filename)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".geoutils-las-", dir=destination.parent) as directory:
+        output = pathlib.Path(directory) / destination.name
+        with laspy.open(output, mode="w", header=header, laz_backend=backend) as writer:
+            for partition in _array_partitions(points, chunks):
+                records = laspy.ScaleAwarePointRecord.zeros(partition.size, header=header)
+                x, y, values = partition.pc.to_xyz()
+                z = values if elevation == partition.name else partition.coords[elevation].data
+                if not np.isfinite(np.stack((x, y, z))).all():
+                    raise ValueError("LAS output requires finite X, Y and Z coordinates.")
+                records.x, records.y, records.z = x, y, z
+                for name in attribute_names:
+                    original = partition.data if name == partition.name else partition.coords[name].data
+                    records[name] = original
+                    if not np.array_equal(np.asarray(records[name]), original):
+                        raise ValueError(f"LAS cannot preserve values in attribute {name!r} with this point format.")
+                writer.write_points(records)
+        os.replace(output, destination)
+
+
+# In-memory and Dask partition writers
+##################################
+
+
+def _write_laspy_dataframe(
+    filename: str | pathlib.Path,
+    pc: gpd.GeoDataFrame | pd.DataFrame,
+    data_name: str | None,
+    header: Any,
+    chunks: int | None = None,
+    laz_chunk_size: int | None = None,
+) -> None:
+    """Feed an in-memory dataframe, optionally split into row partitions, to the common writer."""
+
+    _write_laspy_partitions(
+        filename=filename,
+        partitions=_iter_dataframe_partitions(pc=pc, partition_size=chunks),
+        data_name=data_name,
+        header=header,
+        laz_chunk_size=laz_chunk_size,
+    )
+
+
+def _write_laspy_dask_dataframe(
+    filename: str | pathlib.Path,
+    pc: Any,
+    data_name: str | None,
+    header: Any,
+    laz_chunk_size: int | None = None,
+) -> None:
+    """Compute a Dask DataFrame partition by partition and feed the common writer."""
+
+    # Obtain partition handles without computing the complete Dask dataframe
+    delayed_partitions = pc.to_delayed()
+
+    def partitions() -> Iterator[gpd.GeoDataFrame]:
+        """Compute and yield one geospatial partition at a time."""
+
+        for delayed_partition in delayed_partitions:
+            # Sequential computation bounds client memory during LAS writing
+            part = delayed_partition.compute()
+            yield _as_geodataframe(part, crs=getattr(pc, "_geoutils_attrs", {}).get("crs"))
+
+    _write_laspy_partitions(
+        filename=filename,
+        partitions=partitions(),
+        data_name=data_name,
+        header=header,
+        laz_chunk_size=laz_chunk_size,
+    )
+
+
+# Multiprocessing partition writer
+##################################
+
+
+def _write_laspy_temp_partition(
+    filename: str | pathlib.Path,
+    pc: gpd.GeoDataFrame | pd.DataFrame | str | pathlib.Path,
+    data_name: str | None,
+    header: Any,
+    check_attributes: bool = False,
+) -> str:
+    """
+    Write one dataframe or saved dataframe partition to a temporary LAS file.
+
+    When exact attribute preservation is required, _dataframe_to_lasdata() encodes the partition first so integer
+    overflow and scaled dimension rounding can be detected before the temporary file is accepted.
+    """
+
+    # Load saved partitions inside the worker so the parent process only sends their small filenames
+    saved_partition = pd.read_pickle(pc) if isinstance(pc, (str, pathlib.Path)) else pc
+    dataframe = _as_geodataframe(saved_partition)
+
+    # Check conversions that must preserve every attribute before saving the encoded LAS records
+    if check_attributes:
+        try:
+            encoded = _dataframe_to_lasdata(dataframe, data_name=data_name, header=header)
+        except OverflowError as error:
+            raise ValueError(
+                "LAS output cannot preserve point attributes with the selected dimension types."
+            ) from error
+
+        _check_las_attributes(dataframe, data_name, encoded)
+        encoded.write(filename)
+        return os.fspath(filename)
+
+    _write_laspy_dataframe(
+        filename=filename,
+        pc=dataframe,
+        data_name=data_name,
+        header=header,
+        chunks=None,
+    )
+    return os.fspath(filename)
+
+
+def _stitch_laspy_files(
+    filename: str | pathlib.Path,
+    partition_filenames: Iterable[str | pathlib.Path],
+    header: Any,
+    chunk_size: int,
+    laz_chunk_size: int | None = None,
+) -> None:
+    """Stream partition files into the final LAS/LAZ output."""
+
+    laspy = import_optional("laspy")
+
+    # Stream temporary point records into one output without loading whole files
+    write_header = header.copy()
+    write_header.partial_reset()
+    backend = _get_laz_write_backend(filename, laz_chunk_size)
+    with laspy.open(filename, mode="w", header=write_header, laz_backend=backend) as writer:
+        for partition_filename in partition_filenames:
+            with laspy.open(partition_filename) as reader:
+                for points in reader.chunk_iterator(chunk_size):
+                    writer.write_points(points)
+
+
+def _write_laspy_multiproc_partitions(
+    filename: str | pathlib.Path,
+    partitions: Iterable[gpd.GeoDataFrame | pd.DataFrame | str | pathlib.Path],
+    data_name: str | None,
+    header: Any,
+    chunk_size: int,
+    cluster: Any,
+    check_attributes: bool = False,
+    laz_chunk_size: int | None = None,
+) -> None:
+    """
+    Write dataframe partitions in workers, then stitch them in their supplied order.
+
+    _write_laspy_temp_partition() gives each worker an independent LAS file because a shared LAS stream cannot be
+    written concurrently. _stitch_laspy_files() then copies those encoded records into the destination without
+    reordering rows.
+    """
+
+    if chunk_size <= 0:
+        raise ValueError("Argument 'chunks' must be a strictly positive integer.")
+
+    # Workers write independent files because concurrent writes to one LAS stream are unsafe
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        futures = []
+        for index, part in enumerate(partitions):
+            partition_path = pathlib.Path(tmp_dir) / f"partition_{index}.las"
+            futures.append(
+                cluster.submit(_write_laspy_temp_partition, partition_path, part, data_name, header, check_attributes)
+            )
+
+        # Gather paths in input order before streaming all temporary files together
+        written_paths = cluster.gather(futures)
+        _stitch_laspy_files(
+            filename=filename,
+            partition_filenames=written_paths,
+            header=header,
+            chunk_size=chunk_size,
+            laz_chunk_size=laz_chunk_size,
+        )
+
+
+# Spatial file tiling
+#####################
+
+
+def _write_laspy_spatial_chunks(
+    filename: str | pathlib.Path,
+    output_dir: str | pathlib.Path,
+    block_bounds: Iterable[BoundingBox | Sequence[float]],
+    data_name: str | None = "Z",
+    chunk_size: int = 1_000_000,
+    prefix: str = "block",
+) -> list[pathlib.Path]:
+    """
+    Stream one source into separate LAS files for each requested X/Y block.
+
+    This is the preferred LAS/LAZ strategy when many spatial blocks are needed
+    and the source is not COPC-indexed.
+    """
+
+    laspy = import_optional("laspy")
+
+    # Create the destination before opening any source point records
+    output_path = pathlib.Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    metadata = _load_laspy_metadata(filename)
+    blocks = [_bounds_from_tuple(bounds) for bounds in block_bounds]
+    if len(blocks) == 0:
+        return []
+
+    # Delay opening each writer until its block receives at least one point
+    output_files = [output_path / f"{prefix}_{index}.las" for index in range(len(blocks))]
+    writers: list[Any | None] = [None] * len(blocks)
+
+    with laspy.open(filename) as reader:
+        header = reader.header.copy()
+        header.partial_reset()
+        try:
+            for points in reader.chunk_iterator(chunk_size):
+                # Route each streamed point chunk across all destination blocks
+                x = points.x.copy()
+                y = points.y.copy()
+                for index, bounds in enumerate(blocks):
+                    include_right = np.isclose(bounds.right, metadata.bounds.right)
+                    include_top = np.isclose(bounds.top, metadata.bounds.top)
+                    mask = _point_bounds_mask(
+                        x=x,
+                        y=y,
+                        bounds=bounds,
+                        include_right=include_right,
+                        include_top=include_top,
+                    )
+                    if not np.any(mask):
+                        continue
+                    # Open a block writer on first use, then append later source chunks
+                    writer = writers[index]
+                    if writer is None:
+                        writer = laspy.open(output_files[index], mode="w", header=header.copy())
+                        writers[index] = writer
+                    writer.write_points(points[mask])
+        finally:
+            for writer in writers:
+                if writer is not None:
+                    writer.close()
+
+    # Ensure empty spatial chunks have valid LAS files too
+    for index, writer in enumerate(writers):
+        if writer is None:
+            _write_laspy_partitions(
+                filename=output_files[index],
+                partitions=[],
+                data_name=data_name,
+                header=header,
+            )
+
+    return output_files
+
+
+# Parent write dispatcher
+#########################
+
+
+def _write_laspy(
+    filename: str | pathlib.Path,
+    pc: gpd.GeoDataFrame | pd.DataFrame | Any,
+    data_name: str | None,
+    version: Any = None,
+    point_format: Any = None,
+    offsets: tuple[float, float, float] | None = None,
+    scales: tuple[float, float, float] | None = None,
+    chunks: int | None = None,
+    mp_config: MultiprocConfig | None = None,
+    laz_chunk_size: int | None = None,
+    **kwargs: Any,
+) -> None:
+    """
+    Dispatch LAS/LAZ writing to the in-memory, Dask or multiprocessing partition path.
+
+    In-memory dataframes are optionally split into sequential row partitions. Dask
+    dataframes are computed one existing partition at a time. Multiprocessing
+    writes independent temporary files in workers and stitches them afterward.
+    """
+
+    if chunks is not None and chunks <= 0:
+        raise ValueError("Argument 'chunks' must be a strictly positive integer.")
+
+    if mp_config is not None and is_dask_dataframe(pc):
+        raise ValueError("Multiprocessing LAS writing is not supported for Dask-backed point clouds.")
+
+    # Dask metadata describes columns and dtypes without computing a partition
+    header_pc = pc._meta if is_dask_dataframe(pc) else pc
+    crs = getattr(pc, "_geoutils_attrs", {}).get("crs") if is_dask_dataframe(pc) else None
+    header = _build_laspy_header(
+        pc=header_pc,
+        data_name=data_name,
+        version=version,
+        point_format=point_format,
+        offsets=offsets,
+        scales=scales,
+        crs=crs,
+        **kwargs,
+    )
+
+    # Select one partition producer while sharing header creation and record conversion
+    if is_dask_dataframe(pc):
+        _write_laspy_dask_dataframe(
+            filename=filename, pc=pc, data_name=data_name, header=header, laz_chunk_size=laz_chunk_size
+        )
+        return
+
+    if mp_config is not None:
+        _write_laspy_multiproc_partitions(
+            filename=filename,
+            partitions=_iter_dataframe_partitions(pc=pc, partition_size=_point_partition_size(mp_config)),
+            data_name=data_name,
+            header=header,
+            chunk_size=_point_partition_size(mp_config),
+            cluster=mp_config.cluster,
+            laz_chunk_size=laz_chunk_size,
+        )
+        return
+
+    _write_laspy_dataframe(
+        filename=filename,
+        pc=pc,
+        data_name=data_name,
+        header=header,
+        chunks=chunks,
+        laz_chunk_size=laz_chunk_size,
+    )

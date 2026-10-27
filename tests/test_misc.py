@@ -10,7 +10,12 @@ import yaml  # type: ignore
 from packaging.version import Version
 
 import geoutils
-from geoutils._misc import copy_doc, deprecate, diff_environment_yml
+from geoutils._misc import (
+    _trim_process_memory,
+    copy_doc,
+    deprecate,
+    diff_environment_yml,
+)
 
 
 class TestMisc:
@@ -42,7 +47,10 @@ class TestMisc:
                 assert len(diff_pip_check) == 0
 
         # We do the same for the conda dependency, first a sanity check that everything that is in env is also in dev-ev
-        diff_conda_check = list(set(conda_dep_env) - set(conda_dep_devenv))
+        # Compare package names because the development environment can require newer versions
+        conda_names_env = {re.split(r"[<>=!]", dependency)[0] for dependency in conda_dep_env}
+        conda_names_devenv = {re.split(r"[<>=!]", dependency)[0] for dependency in conda_dep_devenv}
+        diff_conda_check = list(conda_names_env - conda_names_devenv)
         assert len(diff_conda_check) == 0
 
     @pytest.mark.parametrize("deprecation_increment", [-1, 0, 1, None])
@@ -183,3 +191,18 @@ class TestMisc:
             return 1
 
         assert doesnotexist.__doc__ == "This function documentation does not exist in GeoPandas (likely deprecated)."
+
+    def test_trim_process_memory__missing_process_library(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Checks that memory trimming is skipped when the platform does not support it."""
+
+        import ctypes
+
+        # Simulate Windows, where CDLL(None) raises TypeError instead of exposing the C process library
+        def reject_null_library(name: str | None) -> None:
+            assert name is None
+            raise TypeError("argument of type 'NoneType' is not iterable")
+
+        monkeypatch.setattr(ctypes, "CDLL", reject_null_library)
+
+        # Check the worker stays usable
+        _trim_process_memory()

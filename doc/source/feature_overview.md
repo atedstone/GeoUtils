@@ -1,272 +1,233 @@
----
-file_format: mystnb
-jupytext:
-  formats: md:myst
-  text_representation:
-    extension: .md
-    format_name: myst
-kernelspec:
-  display_name: geoutils-env
-  language: python
-  name: geoutils
----
 (feature-overview)=
+# Feature and scalability overview
 
-# Feature overview
+GeoUtils provides a unified API for manipulating **raster**, **vector**, and **point cloud** data, and provides **scalable CPU execution** for most raster and point cloud operations, as well as some vector operations, through Dask or multiprocessing.
 
-The following presents a descriptive example show-casing all core features of GeoUtils.
+As many of our numerical operations rely on NumPy, SciPy, or Numba, those are planned to be linked to their **GPU counterparts** (CuPy and Numba CUDA) in the future.
 
-```{tip}
-All pages of this documentation containing code cells can be **run interactively online without the need of setting up your own environment**. Simply click the top launch button!
-(MyBinder can be a bit capricious: you might have to be patient, or restart it after the build is done the first time 😅)
-
-Alternatively, start your own notebook to test GeoUtils at [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/GlacioHack/geoutils/main).
-```
-
-```{code-cell} ipython3
-:tags: [remove-cell]
-
-# To get a good resolution for displayed figures
-from matplotlib import pyplot
-pyplot.rcParams['figure.dpi'] = 600
-pyplot.rcParams['savefig.dpi'] = 600
-pyplot.rcParams['font.size'] = 9
-```
-
-## The core {class}`~geoutils.Raster`, {class}`~geoutils.Vector` and {class}`~geoutils.PointCloud` objects
-
-In GeoUtils, geospatial handling is object-based and revolves around {class}`~geoutils.Raster` and {class}`~geoutils.Vector`.
-These link to either **in-memory** or **on-disk** datasets, opened by calling the object from a filepath for the latter.
-
-```{code-cell} ipython3
-import geoutils as gu
-
-# Examples files: infrared band of Landsat and glacier outlines
-filename_rast = gu.examples.get_path("everest_landsat_b4")
-filename_vect = gu.examples.get_path("everest_rgi_outlines")
-
-# Open files by calling Raster and Vector
-rast = gu.Raster(filename_rast)
-vect = gu.Vector(filename_vect)
-```
-
-A {class}`~geoutils.Raster` is an object with four main attributes: a {class}`numpy.ma.MaskedArray` as {attr}`~geoutils.Raster.data`, a
-{class}`pyproj.crs.CRS` as {attr}`~geoutils.Raster.crs`, an [{class}`affine.Affine`](https://rasterio.readthedocs.io/en/stable/topics/migrating-to-v1.html#affine-affine-vs-gdal-style-geotransforms)
-as {attr}`~geoutils.Raster.transform`, and a {class}`float` or {class}`int` as {attr}`~geoutils.Raster.nodata`.
-
-
-```{code-cell} ipython3
-# The opened raster
-rast
-```
-
-```{important}
-When a file exists on disk, {class}`~geoutils.Raster` is linked to a {class}`rasterio.io.DatasetReader` object for loading the metadata. The array will be
-**loaded in-memory implicitly** when {attr}`~geoutils.Raster.data` is required by an operation.
-
-See {ref}`core-lazy-load` for more details.
-```
-
-A {class}`~geoutils.Vector` is an object with a single main attribute: a {class}`~geopandas.GeoDataFrame` as {attr}`~geoutils.Vector.ds`, for which
-most methods are wrapped directly into {class}`~geoutils.Vector`.
-
-```{code-cell} ipython3
-# The opened vector
-vect
-```
-
-All other attributes are derivatives of those main attributes, or of the filename on disk. Attributes of {class}`~geoutils.Raster` and
-{class}`~geoutils.Vector` update with geospatial operations on themselves.
-
-
-## Handling and match-reference
-
-In GeoUtils, geospatial handling operations are based on class methods, such as {func}`~geoutils.Raster.crop` or {func}`~geoutils.Raster.reproject`.
-
-For convenience and consistency, nearly all of these methods can be passed solely another {class}`~geoutils.Raster` or {class}`~geoutils.Vector` as a
-**reference to match** during the operation. A **reference {class}`~geoutils.Vector`** enforces a matching of {attr}`~geoutils.Vector.bounds` and/or
-{attr}`~geoutils.Vector.crs`, while a **reference {class}`~geoutils.Raster`** can also enforce a matching of {attr}`~geoutils.Raster.res`, depending on the nature of the operation.
-
-
-```{code-cell} ipython3
-# Print initial bounds of the vector
-print(vect.bounds)
-# Crop vector to raster's extent, and add clipping option (otherwise keeps all intersecting features)
-vect_cropped = vect.crop(rast, clip=True)
-# Print bounds of cropped + clipped vector
-print(vect_cropped.bounds)
-```
-
-```{margin}
-<sup>1</sup>The names of geospatial handling methods is largely based on [GDAL and OGR](https://gdal.org/)'s, with the notable exception of {func}`~geoutils.Vector.reproject` that better applies to vectors than `warp`.
-```
-
-Additionally, in GeoUtils, **methods that apply to the same georeferencing attributes have consistent naming**<sup>1</sup> across {class}`~geoutils.Raster` and {class}`~geoutils.Vector`.
-
-A {func}`~geoutils.Raster.reproject` involves a change in {attr}`~geoutils.Raster.crs` or {attr}`~geoutils.Raster.transform`, while a {func}`~geoutils.Raster.crop` only involves a change
-in {attr}`~geoutils.Raster.bounds`. Using {func}`~geoutils.Raster.polygonize` allows to generate a {class}`~geoutils.Vector` from a {class}`~geoutils.Raster`,
-and the other way around for {func}`~geoutils.Vector.rasterize`.
-
-```{list-table}
-   :widths: 30 30 30
-   :header-rows: 1
-
-   * - **Class**
-     - {class}`~geoutils.Raster`
-     - {class}`~geoutils.Vector`
-   * - Warping/Reprojection
-     - {func}`~geoutils.Raster.reproject`
-     - {func}`~geoutils.Vector.reproject`
-   * - Cropping/Clipping
-     - {func}`~geoutils.Raster.crop`
-     - {func}`~geoutils.Vector.crop`
-   * - Rasterize/Polygonize
-     - {func}`~geoutils.Raster.polygonize`
-     - {func}`~geoutils.Vector.rasterize`
-```
-
-All methods can also be passed any number of georeferencing arguments such as {attr}`~geoutils.Raster.shape` or {attr}`~geoutils.Raster.res`, and will
-naturally deduce others from the input {class}`~geoutils.Raster` or {class}`~geoutils.Vector`, much as in [GDAL](https://gdal.org/)'s command line.
-
-
-## Higher-level analysis tools
-
-GeoUtils also implements higher-level geospatial analysis tools for both {class}`Rasters<geoutils.Raster>` and {class}`Vectors<geoutils.Vector>`. For
-example, one can compute the distance to a {class}`~geoutils.Vector` geometry, or to target pixels of a {class}`~geoutils.Raster`, using
-{func}`~geoutils.Vector.proximity`.
-
-As with the geospatial handling functions previously listed, many analysis functions can take a {class}`~geoutils.Raster` or {class}`~geoutils.Vector` as a
-**reference to utilize** during the operation. In the case of {func}`~geoutils.Vector.proximity`, passing a {class}`~geoutils.Raster` serves as a reference
-for the georeferenced grid on which to compute the distances.
-
-```{code-cell} ipython3
-# Compute proximity to vector on raster's grid
-rast_proximity_to_vec = vect.proximity(rast)
-```
-
-```{note}
-Right now, the array {attr}`~geoutils.Raster.data` of `rast` is still not loaded. Applying {func}`~geoutils.Raster.crop` does not yet require loading,
-and `rast`'s metadata is sufficient to provide a georeferenced grid for {func}`~geoutils.Vector.proximity`. The array will only be loaded when necessary.
-```
-
-## Quick plotting
-
-To facilitate the analysis process, GeoUtils includes quick plotting tools that support multiple colorbars and implicitly add layers to the current axis.
-Those are build on top of {func}`rasterio.plot.show` and {func}`geopandas.GeoDataFrame.plot`, and relay any argument passed.
+The **{ref}`summary tables<tables-overview>` directly below** list the core features of GeoUtils and their scalability.
 
 ```{seealso}
-GeoUtils' plotting tools only aim to smooth out the most common hassles when quickly plotting raster and vectors.
-
-For advanced plotting tools to create "publication-quality" figures, see [Cartopy](https://scitools.org.uk/cartopy/docs/latest/) or
-[GeoPlot](https://residentmario.github.io/geoplot/index.html).
+If you are interested in **porting from GDAL/OGR**, see our {ref}`cheatsheet-osgeo` page.
+While tables below provide a scalability summary, the detailed **scalable execution behaviour of all operations** is available on the {ref}`scalability-support` page.
+For **performance comparisons**, see the {ref}`benchmarking-performance` page.
 ```
 
-The plotting functionality is named {func}`~geoutils.Raster.plot` everywhere, for consistency. Here again, a {class}`~geoutils.Raster` or
-{class}`~geoutils.Vector` can be passed as a **reference to match** to ensure all data is displayed on the same grid and projection.
+## Summary
 
-```{code-cell} ipython3
-# Plot proximity to vector
-rast_proximity_to_vec = vect.proximity(rast)
-rast_proximity_to_vec.plot(cbar_title="Distance to glacier outline")
-vect.plot(rast_proximity_to_vec, fc="none")
+GeoUtils exposes a **consistent API across raster, vector, and point cloud objects** wherever possible (similar in spirit to the recent [GDAL CLI overhaul](https://gdal.org/en/stable/programs/index.html)). Many operations also support convenient **reference matching** (e.g., matching a grid for reprojection or rasterization, bounds for cropping, or point coordinates for interpolation). See the {ref}`core-match-ref` page for details.
+
+At its core, GeoUtils provides two interchangeable ways to work with geospatial data:
+
+- **Accessors** that extend existing Xarray or GeoPandas structures ({class}`rst <geoutils.DataArrayRasterAccessor>` for rasters, {class}`pc <geoutils.GeoDataFramePointCloudAccessor>` for point clouds, and {class}`vct <geoutils.GeoDataFrameVectorAccessor>` for vectors),
+- **GeoUtils objects** {class}`~geoutils.Raster`, {class}`~geoutils.PointCloud`, and {class}`~geoutils.Vector`.
+
+All raster and point cloud operations support **scalable execution** using [Dask](https://www.dask.org/) or multiprocessing, allowing large datasets to be processed **chunk-by-chunk without loading the full array into memory**. Some vector operations also support scalable execution, although memory is often less limiting for vector data.
+
+Additionally, some numerical routines of GeoUtils provide **multiple computational backends** (e.g., SciPy or Numba implementations).
+
+All methods are tested to ensure they produce **identical results** whether executed in-memory, chunked, or with different computational backends.
+
+(tables-overview)=
+## Data operations
+
+We first describe GeoUtils' core **data operations**, which operate on underlying arrays or geometries and can therefore **benefit from scalable execution**.
+
+```{admonition} Legend
+- **`/`** denotes methods **shared across object types**.
+- **`⟷`** denotes methods **interfacing between two object types**.
 ```
 
-```{tip}
-To quickly visualize a raster directly from a terminal, without opening a Python console/notebook, check out our tool `geoviewer.py` in the {ref}`cli` documentation.
+```{list-table} Common API for data operations
+:widths: 3 5 1
+:header-rows: 1
+:align: left
+:class: tight-table
+
+* - Method
+  - Description
+  - Scalable
+
+* - <span class="gu-table-section">Raster / Vector / Point</span>
+  -
+  -
+
+* - {meth}`plot() <RasterBase.plot>`
+  - Display geospatial data.
+  - ✅
+
+* - {meth}`reproject() <RasterBase.reproject>`
+  - Change CRS or raster grid.
+  - ✅
+
+* - {meth}`crop() <RasterBase.crop>`
+  - Select data within a bounding box.
+  - ✅
+
+* - {meth}`clip() <RasterBase.clip>`
+  - Mask, select or cut data by geometry.
+  - ✅
+
+* - {meth}`translate() <RasterBase.translate>`
+  - Shift spatial coordinates.
+  - ✅
+
+* - <span class="gu-table-section">Raster / Point</span>
+  -
+  -
+
+* - {meth}`create_mask() <VectorBase.create_mask>`
+  - Create boolean masks from geometries.
+  - ✅
+
+* - {meth}`proximity() <RasterBase.proximity>`
+  - Measure distance to target values.
+  - ✅
+
+* - {meth}`filter() <RasterBase.filter>`
+  - Filter values over local neighborhoods.
+  - ✅
+
+* - {meth}`subsample() <RasterBase.subsample>`
+  - Randomly select valid cells or points.
+  - ✅
+
+* - {meth}`cosample() <RasterBase.cosample>`
+  - Select common valid locations across datasets.
+  - ✅
+
+* - {meth}`pairsample() <RasterBase.pairsample>`
+  - Sample valid pairs across spatial distances.
+  - ✅
+
+* - {meth}`stats() <RasterBase.stats>`
+  - Estimate global statistics.
+  - ✅
+
+* - {meth}`stats() <RasterBase.stats>` with ``by``
+  - Estimate statistics grouped by bins, categories or zones.
+  - ✅
+
+* - {meth}`variogram() <RasterBase.variogram>`
+  - Estimate and fit spatial semivariance.
+  - ✅
+
+* - {meth}`estimate_error_structure() <RasterBase.estimate_error_structure>`
+  - Estimate error magnitude and spatial correlation.
+  - ✅
+
+* - {meth}`~RasterBase.random_field`
+  - Generate spatially correlated random values.
+  - ✅
+
+* - <span class="gu-table-section">Raster ⟷ Vector</span>
+  -
+  -
+
+* - {meth}`rasterize() <VectorBase.rasterize>`
+  - Burn geometries onto a raster grid.
+  - ✅
+
+* - {meth}`polygonize() <RasterBase.polygonize>`
+  - Convert raster regions to polygons.
+  - ✅
+
+* - <span class="gu-table-section">Raster ⟷ Point</span>
+  -
+  -
+
+* - {meth}`interp_at_points() <RasterBase.interp_at_points>`
+  - Interpolate raster values at points.
+  - ✅
+
+* - {meth}`reduce_at_points() <RasterBase.reduce_at_points>`
+  - Aggregate raster values around points.
+  - ✅
+
+* - {meth}`to_pointcloud() <RasterBase.to_pointcloud>`
+  - Convert raster cells to points.
+  - ✅
+
+* - {meth}`from_pointcloud_regular() <RasterBase.from_pointcloud_regular>`
+  - Convert regular points to a raster.
+  - ❌
+
+* - {meth}`grid() <PointCloudBase.grid>`
+  - Create a raster from irregular points.
+  - ✅
 ```
 
-## Pythonic arithmetic and NumPy interface
+## Metadata properties and operations
 
-All {class}`~geoutils.Raster` objects support Python arithmetic ({func}`+<operator.add>`, {func}`-<operator.sub>`, {func}`/<operator.truediv>`, {func}`//<operator.floordiv>`, {func}`*<operator.mul>`,
-{func}`**<operator.pow>`, {func}`%<operator.mod>`) with any other {class}`~geoutils.Raster`, {class}`~numpy.ndarray` or
-number. With another {class}`~geoutils.Raster`, the georeferencing must match, while only the shape with a {class}`~numpy.ndarray`.
+In addition to data operations, GeoUtils exposes **metadata properties and methods** consistently across geospatial objects.
+These rely only on metadata and therefore **do not load or modify underlying data arrays**.
 
-```{code-cell} ipython3
-# Add 1 to the raster array
-rast += 1
-```
+```{list-table} Common API from metadata operations
+:widths: 3 7
+:header-rows: 1
+:align: left
+:class: tight-table
 
-Additionally, the {class}`~geoutils.Raster` object possesses a NumPy masked-array interface that allows to apply to it any [NumPy universal function](https://numpy.org/doc/stable/reference/ufuncs.html) and
-most other NumPy array functions, while logically casting {class}`dtype<numpy.dtype>` and respecting {attr}`~geoutils.Raster.nodata` values.
+* - Attribute / Method
+  - Description
 
-```{code-cell} ipython3
-# Apply a normalization to the raster
-import numpy as np
-rast = (rast - np.min(rast)) / (np.max(rast) - np.min(rast))
-```
+* - <span class="gu-table-section">Raster / Vector / Point</span>
+  -
 
-## Casting to raster mask, indexing and overload
+* - {attr}`~RasterBase.crs`
+  - Coordinate reference system (CRS) of object.
 
-All {class}`~geoutils.Raster` objects also support Python logical comparison operators ({func}`==<operator.eq>`, {func}` != <operator.ne>`, {func}`>=<operator.ge>`, {func}`><operator.gt>`, {func}`<=<operator.le>`,
-{func}`<<operator.lt>`), or more complex NumPy logical functions. Those operations automatically casts them into a raster mask, i.e. a boolean
-{class}`~geoutils.Raster`.
+* - {attr}`~RasterBase.bbox`
+  - Bounding box of object.
 
-```{code-cell} ipython3
-# Get mask of an AOI: infrared index above 0.6, at least 200 m from glaciers
-mask_aoi = np.logical_and(rast > 0.6, rast_proximity_to_vec > 200)
-```
+* - {attr}`~RasterBase.footprint`
+  - Footprint polygon geometry of object.
 
-Raster masks can then be used for indexing a {class}`~geoutils.Raster`, which returns a {class}`~numpy.ma.MaskedArray` of indexed values.
+* - {attr}`~RasterBase.is_loaded`
+  - Whether geospatial object is loaded in-memory.
 
-```{code-cell} ipython3
-# Index raster with mask to extract a 1-D array
-values_aoi = rast[mask_aoi]
-```
+* - {attr}`~RasterBase.name`
+  - Filename of object on disk, if it exists.
 
-Raster masks also have simplified {class}`~geoutils.Raster` methods due to their boolean {class}`dtype<numpy.dtype>` rendering many arguments implicit.
-For instance, using {func}`~geoutils.Raster.polygonize` with a raster mask is straightforward, to retrieve a {class}`~geoutils.Vector` of the area-of-interest:
+* - {meth}`get_bbox_projected() <RasterBase.get_bbox_projected>`
+  - Bounding box projected in another CRS.
 
-```{code-cell} ipython3
-# Polygonize areas where mask is True
-vect_aoi = mask_aoi.polygonize()
-```
+* - {meth}`get_footprint_projected() <RasterBase.get_footprint_projected>`
+  - Footprint polygon geometry in other CRS.
 
-```{code-cell} ipython3
-# Plot result
-rast.plot(cmap='Reds', cbar_title='Normalized infrared')
-vect_aoi.plot(fc='none', ec='k', lw=0.75)
-```
+* - {meth}`get_metric_crs() <RasterBase.get_metric_crs>`
+  - Get metric CRS suitable for this object.
 
-## Saving to file
+* - {meth}`~RasterBase.info`
+  - Summary of attributes for geospatial object.
 
-Finally, for saving a {class}`~geoutils.Raster` or {class}`~geoutils.Vector` to file, simply call the {func}`~geoutils.Raster.to_file` function.
+* - <span class="gu-table-section">Raster / Point</span>
+  -
 
-```{code-cell} ipython3
-# Save our AOI vector
-vect_aoi.to_file("myaoi.gpkg")
-```
+* - {attr}`~RasterBase.data`
+  - Data array (2D or 3D for raster, 1D for point cloud).
 
-```{code-cell} ipython3
-:tags: [remove-cell]
-import os
-os.remove("myaoi.gpkg")
-```
+* - {attr}`~RasterBase.shape`
+  - Shape of data array.
 
-## Parsing sensor metadata
+* - {attr}`~RasterBase.is_mask`
+  - Whether object is a mask.
 
-In our case, `rast` would be better opened using the ``parse_sensor_metadata`` argument of a {class}`~geoutils.Raster`,
-which tentatively parses metadata recognized from the filename or auxiliary files.
+* - <span class="gu-table-section">Raster</span>
+  -
 
-```{code-cell} ipython3
-# Name of the image we used
-import os
-print(os.path.basename(filename_rast))
-```
+* - {attr}`~RasterBase.transform`
+  - Geotransform to map raster cells to spatial coordinates.
 
-```{code-cell} ipython3
-# Open while parsing metadata
-rast = gu.Raster(filename_rast, parse_sensor_metadata=True, silent=False)
-```
+* - {attr}`~RasterBase.nodata`
+  - Nodata value used to represent missing data on disk.
 
-```{admonition} Wrap-up
-In a few lines, we:
- - **easily handled georeferencing** operations on rasters and vectors,
- - performed numerical calculations **inherently respecting invalid data**,
- - **casted to a mask** implicitly from a logical operation on raster, and
- - **vectorized a mask** without need for any additional metadata, simply using the nature of the mask object!
+* - {attr}`~RasterBase.area_or_point`
+  - Interpretation of raster cell values, area-average or point-center.
 
-**Our result:** a vector of high infrared absorption indexes at least 200 meters away from glaciers
-near Everest, which likely corresponds to **perennial snowfields**.
+* - <span class="gu-table-section">Point</span>
+  -
 
-Otherwise, for more **hands-on** examples, explore GeoUtils' gallery of examples!
+* - {attr}`~geoutils.pointcloud.base.GeometryPointCloudBase.point_count`
+  - Number of points in the point cloud.
 ```

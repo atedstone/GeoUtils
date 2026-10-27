@@ -2,37 +2,88 @@
 # API reference
 
 This page provides a summary of GeoUtils’ API.
-For more details and examples, refer to the relevant chapters in the main part of the
-documentation.
+For more details and examples, refer to the relevant chapters in the main part of the documentation.
 
 ```{eval-rst}
 .. currentmodule:: geoutils
 ```
 
-## Raster
 
-```{eval-rst}
-.. minigallery:: geoutils.Raster
-      :add-heading:
+<!--
+Hidden toctree so object and accessor pages are generated and discoverable via cross-references, without duplicating
+the main API method summaries. This needs to be listed before any other API.
+-->
+```{toctree}
+:maxdepth: 1
+:hidden:
+
+DataArray.rst accessor <api_rst>
+Dataset.rst accessor <api_rst_dataset>
+Raster <api_raster>
+GeoDataFrame.vct accessor <api_vct>
+Vector <api_vector>
+DataArray.pc accessor <api_pc_dataarray>
+Dataset.pc accessor <api_pc_dataset>
+GeoDataFrame.pc accessor <api_pc>
+PointCloud <api_pointcloud>
+Inherited Vector methods <api_vector_inherited>
 ```
 
-### Opening a file
+(raster-api)=
+## Raster API
+
+GeoUtils exposes the raster API through the following interfaces:
+
+- A {class}`DataArray.rst <geoutils.DataArrayRasterAccessor>` accessor extending {class}`xarray.DataArray` objects as rasters.
+- A {class}`Dataset.rst <geoutils.DatasetRasterAccessor>` accessor applying raster methods to compatible variables in {class}`xarray.Dataset` objects.
+- {class}`~geoutils.Raster`, an interface operating directly on a GeoUtils object.
+
+
+The DataArray accessor and Raster expose the **same methods and attributes**. The Dataset accessor applies operations
+to all compatible raster variables by default, or to those selected.
+
+Only **file opening** and **scalable execution** differ substantially between the accessors and Raster:
+
+- **File opening:** {meth}`~geoutils.open_raster` is used for an {class}`xarray.DataArray` object, while {class}`~geoutils.Raster` objects are opened by instantiating the class,
+- **Scalable execution:** the {class}`DataArray.rst <geoutils.DataArrayRasterAccessor>` accessor supports **Dask**, while the {class}`~geoutils.Raster` supports **Multiprocessing** instead.
+
+### Opening a raster file
+
+Use {meth}`~geoutils.open_raster` for an {class}`xarray.DataArray`, or instantiate for a {class}`~geoutils.Raster`.
 
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
 
-    Raster
-    Raster.info
+    open_raster
+    Raster.__init__
 ```
 
-### Create from an array
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+    :template: raster_method.rst
+
+    ~raster.base.RasterBase.info
+```
+
+### Create raster from an array
+
+Use {func}`~geoutils.raster.from_array` to create a DataArray, or pass `as_object_type="dataset"` to create a Dataset.
 
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
 
-    Raster.from_array
+    ~raster.from_array
+```
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+    :template: raster_method.rst
+
+    ~raster.base.RasterBase.from_array
 ```
 
 (api-raster-attrs)=
@@ -42,12 +93,13 @@ documentation.
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
+    :template: raster_method.rst
 
-    Raster.data
-    Raster.crs
-    Raster.transform
-    Raster.nodata
-    Raster.area_or_point
+    ~raster.base.RasterBase.data
+    ~raster.base.RasterBase.crs
+    ~raster.base.RasterBase.transform
+    ~raster.base.RasterBase.nodata
+    ~raster.base.RasterBase.area_or_point
 ```
 
 ### Derived attributes
@@ -55,15 +107,17 @@ documentation.
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
+    :template: raster_method.rst
 
-    Raster.shape
-    Raster.height
-    Raster.width
-    Raster.count
-    Raster.bands
-    Raster.res
-    Raster.bounds
-    Raster.dtype
+    ~raster.base.RasterBase.shape
+    ~raster.base.RasterBase.height
+    ~raster.base.RasterBase.width
+    ~raster.base.RasterBase.count
+    ~raster.base.RasterBase.bands
+    ~raster.base.RasterBase.res
+    ~raster.base.RasterBase.bbox
+    ~raster.base.RasterBase.footprint
+    ~raster.base.RasterBase.dtype
 ```
 
 ### Other attributes
@@ -71,30 +125,56 @@ documentation.
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
+    :template: raster_method.rst
 
-    Raster.is_mask
-    Raster.is_loaded
-    Raster.name
-    Raster.driver
-    Raster.tags
+    ~raster.base.RasterBase.is_mask
+    ~raster.base.RasterBase.is_loaded
+    ~raster.base.RasterBase.name
+    ~raster.base.RasterBase.driver
+    ~raster.base.RasterBase.tags
 ```
 
 (api-geo-handle)=
 
-### Geospatial handling methods
+### Geospatial operations
 
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
+    :template: raster_method.rst
 
-    Raster.crop
-    Raster.icrop
-    Raster.reproject
-    Raster.polygonize
-    Raster.proximity
-    Raster.interp_points
-    Raster.reduce_points
-    Raster.filter
+    ~raster.base.RasterBase.crop
+    ~raster.base.RasterBase.icrop
+    ~raster.base.RasterBase.clip
+    ~raster.base.RasterBase.reproject
+    ~raster.base.RasterBase.polygonize
+    ~raster.base.RasterBase.interp_at_points
+    ~raster.base.RasterBase.resample_at_points
+    ~raster.base.RasterBase.reduce_at_points
+    ~raster.base.RasterBase.krige
+    ~raster.base.RasterBase.random_field
+```
+
+### Proximity
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+    :template: raster_method.rst
+
+    ~raster.base.RasterBase.proximity
+```
+
+### Filters
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+    :template: raster_method.rst
+
+    ~raster.base.RasterBase.filter
+    ~raster.base.RasterBase.fill_nodata
+    ~raster.base.RasterBase.sieve
 ```
 
 ### Plotting
@@ -102,126 +182,134 @@ documentation.
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
+    :template: raster_method.rst
 
-    Raster.plot
+    ~raster.base.RasterBase.plot
 ```
 
-### Get statistics
+(api-raster-statistics)=
+### Statistics
+
+See {ref}`stats` for estimators, grouping by intervals or categories, and variograms.
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+    :template: raster_method.rst
+
+    ~raster.base.RasterBase.stats
+    ~raster.base.RasterBase.variogram
+    ~raster.base.RasterBase.estimate_error_structure
+```
+
+(api-raster-sampling)=
+### Sampling
+
+See {ref}`sampling` for selecting valid observations, common locations and spatial pairs.
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+    :template: raster_method.rst
+
+    ~raster.base.RasterBase.subsample
+    ~raster.base.RasterBase.cosample
+    ~raster.base.RasterBase.pairsample
+```
+
+### Data manipulation
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+    :template: raster_method.rst
+
+    ~raster.base.RasterBase.copy
+    ~raster.base.RasterBase.to_nanarray
+```
+
+The following methods apply only to the {class}`~geoutils.Raster` object. Use native Xarray methods such as
+{meth}`~xarray.DataArray.astype` and {meth}`~xarray.DataArray.where` with the accessor interface.
 
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
 
-    Raster.get_stats
-```
-
-### Get or update data methods
-
-```{eval-rst}
-.. autosummary::
-    :toctree: gen_modules/
-
-    Raster.copy
     Raster.astype
     Raster.set_mask
-    Raster.set_nodata
-    Raster.get_nanarray
     Raster.get_mask
-    Raster.subsample
 ```
 
-### I/O methods
+### Loading, writing and converting
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+    :template: raster_method.rst
+
+    ~raster.base.RasterBase.load
+    ~raster.base.RasterBase.to_pointcloud
+    ~raster.base.RasterBase.from_pointcloud_regular
+```
+
+Writing to file from accessors or Raster object:
 
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
 
-    Raster.load
+    DataArrayRasterAccessor.to_file
+    DatasetRasterAccessor.to_file
+    DataArrayRasterAccessor.to_geoutils
     Raster.to_file
-    Raster.to_pointcloud
-    Raster.from_pointcloud_regular
     Raster.to_rio_dataset
     Raster.to_xarray
 ```
 
-### Coordinate and extent methods
+### Georeferencing utilities
 
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
+    :template: raster_method.rst
 
-    Raster.xy2ij
-    Raster.ij2xy
-    Raster.coords
-    Raster.translate
-    Raster.outside_image
+    ~raster.base.RasterBase.edit
+    ~raster.base.RasterBase.set_crs
+    ~raster.base.RasterBase.set_transform
+    ~raster.base.RasterBase.set_nodata
+    ~raster.base.RasterBase.set_area_or_point
+    ~raster.base.RasterBase.xy2ij
+    ~raster.base.RasterBase.ij2xy
+    ~raster.base.RasterBase.coords
+    ~raster.base.RasterBase.translate
+    ~raster.base.RasterBase.outside_image
 ```
 
-### Projection methods
+### Projection utilities
 
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
+    :template: raster_method.rst
 
-    Raster.get_metric_crs
-    Raster.get_bounds_projected
-    Raster.get_footprint_projected
-    Raster.intersection
+    ~raster.base.RasterBase.get_metric_crs
+    ~raster.base.RasterBase.get_bbox_projected
+    ~raster.base.RasterBase.get_footprint_projected
+    ~raster.base.RasterBase.intersection
 ```
 
-### Testing methods
+### Testing utilities
 
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
+    :template: raster_method.rst
 
-    Raster.raster_equal
-    Raster.georeferenced_grid_equal
+    ~raster.base.RasterBase.raster_equal
+    ~raster.base.RasterBase.georeferenced_grid_equal
 ```
 
-### Arithmetic with other rasters, arrays or numbers
-
-```{eval-rst}
-.. autosummary::
-    :toctree: gen_modules/
-
-    Raster.__add__
-    Raster.__sub__
-    Raster.__neg__
-    Raster.__mul__
-    Raster.__truediv__
-    Raster.__floordiv__
-    Raster.__mod__
-    Raster.__pow__
-```
-
-And reverse operations.
-
-### Logical operators casting to mask (boolean raster)
-
-```{eval-rst}
-.. autosummary::
-    :toctree: gen_modules/
-
-    Raster.__eq__
-    Raster.__ne__
-    Raster.__lt__
-    Raster.__le__
-    Raster.__gt__
-    Raster.__ge__
-```
-
-### Array interface with NumPy
-
-```{eval-rst}
-.. autosummary::
-    :toctree: gen_modules/
-
-    Raster.__array_ufunc__
-    Raster.__array_function__
-```
-
-## Multiple rasters
+### Multiple rasters
 
 ```{eval-rst}
 .. autosummary::
@@ -232,27 +320,21 @@ And reverse operations.
     raster.merge_rasters
 ```
 
-[//]: # (## Multiprocessing)
+(vector-api)=
+## Vector API
 
-[//]: # ()
-[//]: # (```{eval-rst})
+GeoUtils exposes the vector API through two mirrored interfaces:
 
-[//]: # (.. autosummary::)
+- A {class}`vct <geoutils.GeoDataFrameVectorAccessor>` accessor extending {class}`geopandas.GeoDataFrame` objects as vectors.
+- {class}`~geoutils.Vector`, an interface operating directly on a GeoUtils object.
 
-[//]: # (    :toctree: gen_modules/)
+The GeoDataFrame accessor and Vector expose the **same methods and attributes**. Native GeoPandas
+methods are available directly on the GeoDataFrame.
 
-[//]: # ()
-[//]: # (    raster.MultiprocConfig)
+Only **file opening** and **scalable execution** differ substantially between the accessor and Vector:
 
-[//]: # ()
-[//]: # (```)
-
-## Vector
-
-```{eval-rst}
-.. minigallery:: geoutils.Vector
-      :add-heading:
-```
+- **File opening:** {meth}`~geoutils.open_vector` is used for a {class}`~geopandas.GeoDataFrame` object, while {class}`~geoutils.Vector` objects are opened by instantiating the class,
+- **Scalable execution:** the {class}`vct <geoutils.GeoDataFrameVectorAccessor>` accessor supports **Dask**, while the {class}`~geoutils.Vector` supports **Multiprocessing** instead.
 
 ### Opening a file
 
@@ -260,8 +342,16 @@ And reverse operations.
 .. autosummary::
     :toctree: gen_modules/
 
-    Vector
-    Vector.info
+    open_vector
+    Vector.__init__
+```
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+    :template: vector_method.rst
+
+    ~vector.base.VectorBase.info
 ```
 
 ### Main attributes
@@ -270,17 +360,32 @@ And reverse operations.
 .. autosummary::
     :toctree: gen_modules/
 
-    Vector.ds
-    Vector.crs
-    Vector.bounds
-    Vector.name
+    Vector.gdf
+
+.. autosummary::
+    :toctree: gen_modules/
+    :template: vector_method.rst
+
+    ~vector.base.VectorBase.crs
+    ~vector.base.VectorBase.bbox
+    ~vector.base.VectorBase.footprint
+    ~vector.base.VectorBase.name
+    ~vector.base.VectorBase.is_loaded
 ```
 
 ```{caution}
-The {attr}`~geoutils.Vector.bounds` attribute of a {class}`~geoutils.Vector` corresponds to the {attr}`~geopandas.GeoDataFrame.total_bounds` attribute of a
-{class}`~geopandas.GeoDataFrame`, for consistency between rasters and vectors (and can also be accessed through {attr}`~geoutils.Vector.total_bounds`).
+The {attr}`~VectorBase.bbox` attribute of a {class}`~geoutils.Vector` corresponds to the {attr}`~geopandas.GeoDataFrame.total_bounds` attribute of a
+{class}`~geopandas.GeoDataFrame`, while {attr}`geopandas.GeoDataFrame.bounds` returns a {class}`~pandas.Series` of per-feature bounds of the vector.
+```
 
-The equivalent of {attr}`geopandas.GeoDataFrame.bounds` (i.e., a per-feature bounds) for {class}`Vectors<geoutils.Vector>` is {attr}`~geoutils.Vector.geom_bounds`.
+### Writing to file
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+
+    GeoDataFrameVectorAccessor.to_file
+    Vector.to_file
 ```
 
 ### Geospatial handling methods
@@ -288,11 +393,13 @@ The equivalent of {attr}`geopandas.GeoDataFrame.bounds` (i.e., a per-feature bou
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
+    :template: vector_method.rst
 
-    Vector.crop
-    Vector.reproject
-    Vector.rasterize
-    Vector.proximity
+    ~vector.base.VectorBase.crop
+    ~vector.base.VectorBase.clip
+    ~vector.base.VectorBase.reproject
+    ~vector.base.VectorBase.translate
+    ~vector.base.VectorBase.rasterize
 ```
 
 ### Plotting
@@ -300,17 +407,29 @@ The equivalent of {attr}`geopandas.GeoDataFrame.bounds` (i.e., a per-feature bou
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
+    :template: vector_method.rst
 
-    Vector.plot
+    ~vector.base.VectorBase.plot
 ```
 
-### Create mask
+### Create geometry mask
 
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
+    :template: vector_method.rst
 
-    Vector.create_mask
+    ~vector.base.VectorBase.create_mask
+```
+
+### Proximity
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+    :template: vector_method.rst
+
+    ~vector.base.VectorBase.proximity
 ```
 
 ### Geometry manipulation
@@ -318,9 +437,20 @@ The equivalent of {attr}`geopandas.GeoDataFrame.bounds` (i.e., a per-feature bou
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
+    :template: vector_method.rst
 
-    Vector.buffer_metric
-    Vector.buffer_without_overlap
+    ~vector.base.VectorBase.buffer_metric
+    ~vector.base.VectorBase.buffer_without_overlap
+```
+
+### Data manipulation
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+    :template: vector_method.rst
+
+    ~vector.base.VectorBase.copy
 ```
 
 ### Projection tools
@@ -328,11 +458,12 @@ The equivalent of {attr}`geopandas.GeoDataFrame.bounds` (i.e., a per-feature bou
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
+    :template: vector_method.rst
 
-    Vector.get_metric_crs
-    Vector.from_bounds_projected
-    Vector.get_bounds_projected
-    Vector.get_footprint_projected
+    ~vector.base.VectorBase.get_metric_crs
+    ~vector.base.VectorBase.from_bounds_projected
+    ~vector.base.VectorBase.get_bbox_projected
+    ~vector.base.VectorBase.get_footprint_projected
 ```
 
 ### Indexing
@@ -344,201 +475,30 @@ The equivalent of {attr}`geopandas.GeoDataFrame.bounds` (i.e., a per-feature bou
     Vector.__getitem__
 ```
 
-(vector-from-geopandas)=
-
 ### From Shapely and GeoPandas
 
-#### Geometric attributes and methods
+Native operations remain available directly on the GeoDataFrame. The {ref}`vector-from-geopandas` appendix lists the
+additional methods exposed by the {class}`~geoutils.Vector` wrapper and explains how their outputs are converted.
 
-This first category of attributes and methods return a geometric output converted to a {class}`~geoutils.Vector` by default.
+(pointcloud-api)=
+## Point cloud API
 
-**Attributes:**
+GeoUtils exposes the point cloud API through the following interfaces:
 
-```{eval-rst}
-.. autosummary::
-    :toctree: gen_modules/
+- A {class}`DataArray.pc <geoutils.DataArrayPointCloudAccessor>` accessor extending {class}`xarray.DataArray` objects as point clouds.
+- A {class}`Dataset.pc <geoutils.DatasetPointCloudAccessor>` accessor applying point cloud methods to compatible variables in {class}`xarray.Dataset` objects.
+- A {class}`pc <geoutils.GeoDataFramePointCloudAccessor>` accessor extending {class}`geopandas.GeoDataFrame` objects as point clouds.
+- {class}`~geoutils.PointCloud`, an interface operating directly on a GeoUtils object.
 
-    Vector.boundary
-    Vector.centroid
-    Vector.convex_hull
-    Vector.envelope
-    Vector.exterior
-```
+The DataArray and GeoDataFrame accessors and PointCloud expose the **same GeoUtils-specific methods and attributes**.
+The Dataset accessor applies operations to all compatible point variables by default, or to those selected.
+Native Xarray and GeoPandas methods remain available directly on their objects.
 
+Only **file opening** and **scalable execution** differ substantially between the accessors and PointCloud:
 
-**Methods:**
+- **File opening:** {meth}`~geoutils.open_pointcloud` is used for Xarray or GeoPandas objects, while {class}`~geoutils.PointCloud` objects are opened by instantiating the class,
+- **Scalable execution:** the accessors support **Dask**, while the {class}`~geoutils.PointCloud` supports **Multiprocessing** instead.
 
-```{eval-rst}
-.. autosummary::
-    :toctree: gen_modules/
-
-    Vector.representative_point
-    Vector.normalize
-    Vector.make_valid
-    Vector.difference
-    Vector.symmetric_difference
-    Vector.union
-    Vector.union_all
-    Vector.intersection
-    Vector.intersection_all
-    Vector.clip_by_rect
-    Vector.buffer
-    Vector.simplify
-    Vector.affine_transform
-    Vector.translate
-    Vector.rotate
-    Vector.scale
-    Vector.skew
-    Vector.concave_hull
-    Vector.delaunay_triangles
-    Vector.voronoi_polygons
-    Vector.minimum_rotated_rectangle
-    Vector.minimum_bounding_circle
-    Vector.extract_unique_points
-    Vector.remove_repeated_points
-    Vector.offset_curve
-    Vector.reverse
-    Vector.segmentize
-    Vector.polygonize
-    Vector.transform
-    Vector.force_2d
-    Vector.force_3d
-    Vector.line_merge
-    Vector.shortest_line
-    Vector.interpolate
-    Vector.shared_paths
-    Vector.dissolve
-    Vector.explode
-    Vector.sjoin
-    Vector.sjoin_nearest
-    Vector.overlay
-    Vector.clip
-    Vector.snap
-    Vector.to_crs
-    Vector.set_crs
-    Vector.get_geometry
-    Vector.set_geometry
-    Vector.rename_geometry
-    Vector.set_precision
-    Vector.get_precision
-    Vector.get_coordinates
-    Vector.cx
-```
-
-#### Non-geometric per-feature attributes and methods
-
-This second category of attributes and methods return a non-geometric output with same length as the number of features. They are thus appended in the
-dataframe of the current {class}`~geoutils.Vector` by default, using as column name the name of the operation (e.g., "area", "contains" or "intersects").
-
-Otherwise, calling the method from {attr}`Vector.ds<geoutils.Vector.ds>`, they return a {class}`pandas.Series` as in GeoPandas.
-
-**Attributes:**
-
-```{eval-rst}
-.. autosummary::
-    :toctree: gen_modules/
-
-    Vector.area
-    Vector.length
-    Vector.interiors
-    Vector.geom_type
-    Vector.geom_bounds
-    Vector.is_valid
-    Vector.is_empty
-    Vector.is_ring
-    Vector.is_simple
-    Vector.is_ccw
-    Vector.is_closed
-    Vector.has_z
-```
-
-**Methods:**
-
-```{eval-rst}
-.. autosummary::
-    :toctree: gen_modules/
-
-    Vector.contains
-    Vector.geom_equals
-    Vector.crosses
-    Vector.disjoint
-    Vector.intersects
-    Vector.overlaps
-    Vector.touches
-    Vector.within
-    Vector.covers
-    Vector.covered_by
-    Vector.distance
-    Vector.is_valid_reason
-    Vector.count_coordinates
-    Vector.count_geometries
-    Vector.count_interior_rings
-    Vector.get_precision
-    Vector.minimum_clearance
-    Vector.minimum_bounding_radius
-    Vector.contains_properly
-    Vector.dwithin
-    Vector.hausdorff_distance
-    Vector.frechet_distance
-    Vector.hilbert_distance
-    Vector.relate
-    Vector.relate_pattern
-    Vector.project
-```
-
-
-#### I/O, conversions and others
-
-```{important}
-The behaviour of methods below is not modified in {class}`~geoutils.Vector`, as they deal with outputs of different types.
-To ensure those are up-to-date with GeoPandas, alternatively call those from {attr}`Vector.ds<geoutils.Vector.ds>`.
-```
-
-```{eval-rst}
-.. autosummary::
-    :toctree: gen_modules/
-
-    Vector.from_file
-    Vector.from_features
-    Vector.from_postgis
-    Vector.from_dict
-    Vector.from_arrow
-    Vector.to_file
-    Vector.to_feather
-    Vector.to_parquet
-    Vector.to_arrow
-    Vector.to_wkt
-    Vector.to_wkb
-    Vector.to_json
-    Vector.to_postgis
-    Vector.to_geo_dict
-    Vector.to_csv
-```
-
-
-#### Other attributes and methods
-
-
-```{eval-rst}
-.. autosummary::
-    :toctree: gen_modules/
-
-    Vector.has_sindex
-    Vector.sindex
-    Vector.total_bounds
-```
-
-```{seealso}
-The methods above are described in [GeoPandas GeoSeries's API](https://geopandas.org/en/stable/docs/reference/geoseries.html) and [Shapely object's
-documentation](https://shapely.readthedocs.io/en/stable/properties.html).
-```
-
-## Point cloud
-
-```{eval-rst}
-.. minigallery:: geoutils.PointCloud
-      :add-heading:
-```
 
 ### Opening a file
 
@@ -546,8 +506,16 @@ documentation](https://shapely.readthedocs.io/en/stable/properties.html).
 .. autosummary::
     :toctree: gen_modules/
 
-    PointCloud
-    PointCloud.info
+    open_pointcloud
+    PointCloud.__init__
+```
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+    :template: pointcloud_method.rst
+
+    ~pointcloud.base.GeometryPointCloudBase.info
 ```
 
 ### Main attributes
@@ -556,10 +524,17 @@ documentation](https://shapely.readthedocs.io/en/stable/properties.html).
 .. autosummary::
     :toctree: gen_modules/
 
-    PointCloud.ds
-    PointCloud.data_column
-    PointCloud.data
-    PointCloud.crs
+    PointCloud.gdf
+
+.. autosummary::
+    :toctree: gen_modules/
+    :template: pointcloud_method.rst
+
+    ~pointcloud.base.PointCloudBase.data_name
+    ~pointcloud.base.PointCloudBase.data
+    ~pointcloud.base.PointCloudBase.crs
+    ~pointcloud.base.GeometryPointCloudBase.bbox
+    ~pointcloud.base.GeometryPointCloudBase.footprint
 ```
 
 ### Other attributes
@@ -567,24 +542,72 @@ documentation](https://shapely.readthedocs.io/en/stable/properties.html).
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
+    :template: pointcloud_method.rst
 
-    PointCloud.point_count
+    ~pointcloud.base.GeometryPointCloudBase.point_count
+    ~pointcloud.base.PointCloudBase.is_loaded
 ```
 
 
 ### Create and convert from data
 
+Use {func}`~geoutils.pointcloud.from_xyz` to create a DataArray from coordinate and value arrays. Pass
+`as_object_type="dataset"` or `as_object_type="geodataframe"` to choose another representation.
+
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
 
-    PointCloud.from_xyz
-    PointCloud.from_array
-    PointCloud.from_tuples
-    PointCloud.to_xyz
-    PointCloud.to_array
-    PointCloud.to_tuples
+    ~pointcloud.from_xyz
+```
 
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+    :template: pointcloud_method.rst
+
+    ~pointcloud.base.PointCloudBase.from_xyz
+    ~pointcloud.base.PointCloudBase.from_array
+    ~pointcloud.base.PointCloudBase.from_tuples
+    ~pointcloud.base.PointCloudBase.to_xyz
+    ~pointcloud.base.GeometryPointCloudBase.to_array
+    ~pointcloud.base.GeometryPointCloudBase.to_tuples
+
+```
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+
+    PointCloud.to_xarray
+```
+
+### Writing to file
+
+Accessor methods write the native Xarray or GeoPandas representation:
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+
+    DataArrayPointCloudAccessor.to_file
+    DataArrayPointCloudAccessor.to_las
+    DataArrayPointCloudAccessor.to_parquet
+    DatasetPointCloudAccessor.to_file
+    DatasetPointCloudAccessor.to_las
+    DatasetPointCloudAccessor.to_parquet
+    GeoDataFramePointCloudAccessor.to_file
+```
+
+GeoUtils object methods:
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+
+    PointCloud.to_file
+    PointCloud.to_las
+    PointCloud.to_parquet
 ```
 
 ### Geospatial
@@ -592,10 +615,22 @@ documentation](https://shapely.readthedocs.io/en/stable/properties.html).
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
+    :template: pointcloud_method.rst
 
-    PointCloud.crop
-    PointCloud.reproject
-    PointCloud.translate
+    ~pointcloud.base.GeometryPointCloudBase.crop
+    ~pointcloud.base.GeometryPointCloudBase.clip
+    ~pointcloud.base.GeometryPointCloudBase.reproject
+    ~pointcloud.base.GeometryPointCloudBase.translate
+```
+
+### Filtering
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+    :template: pointcloud_method.rst
+
+    ~pointcloud.base.PointCloudBase.filter
 ```
 
 ### Interface with raster
@@ -603,18 +638,61 @@ documentation](https://shapely.readthedocs.io/en/stable/properties.html).
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
+    :template: pointcloud_method.rst
 
-    PointCloud.grid
+    ~pointcloud.base.PointCloudBase.grid
+    ~pointcloud.base.PointCloudBase.krige
+    ~pointcloud.base.PointCloudBase.random_field
 ```
 
-### Statistics
+### Plotting
 
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
+    :template: pointcloud_method.rst
 
-    PointCloud.get_stats
-    PointCloud.subsample
+    ~pointcloud.base.GeometryPointCloudBase.plot
+```
+
+### Data manipulation
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+    :template: pointcloud_method.rst
+
+    ~pointcloud.base.PointCloudBase.copy
+```
+
+(api-point-statistics)=
+### Statistics
+
+See {ref}`stats` for the same statistical workflows on point cloud values.
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+    :template: pointcloud_method.rst
+
+    ~pointcloud.base.PointCloudBase.stats
+    ~pointcloud.base.PointCloudBase.variogram
+    ~pointcloud.base.PointCloudBase.estimate_error_structure
+```
+
+(api-point-sampling)=
+### Sampling
+
+See {ref}`sampling` for sampling values and locations from point clouds.
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+    :template: pointcloud_method.rst
+
+    ~pointcloud.base.PointCloudBase.subsample
+    ~pointcloud.base.PointCloudBase.cosample
+    ~pointcloud.base.PointCloudBase.pairsample
 ```
 
 ### Testing methods
@@ -622,7 +700,166 @@ documentation](https://shapely.readthedocs.io/en/stable/properties.html).
 ```{eval-rst}
 .. autosummary::
     :toctree: gen_modules/
+    :template: pointcloud_method.rst
 
-    PointCloud.pointcloud_equal
-    PointCloud.georeferenced_coords_equal
+    ~pointcloud.base.GeometryPointCloudBase.pointcloud_equal
+    ~pointcloud.base.PointCloudBase.georeferenced_coords_equal
+```
+
+(api-statistics)=
+## Statistics
+
+Most statistical functions are available directly from the objects and accessors, as shown above.
+
+Below, we list functions defining additional estimators, variogram objects, and that can help plot.
+### GeoUtils estimators
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+
+    stats.nmad
+    stats.linear_error
+    stats.rmse
+    stats.sum_square
+```
+
+### Variogram
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+    :template: variogram.rst
+
+    Variogram
+```
+
+### Plotting helpers
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+
+    stats.plot_grouped_stats
+    Variogram.plot
+```
+
+## Numerical operators and uncertainty
+
+See {ref}`core-operators` for neighborhoods, weights and custom definitions, and {ref}`uncertainty` for
+estimation and propagation workflows.
+
+### Operator interfaces and neighborhoods
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+
+    operators.Interpolator
+    operators.Reducer
+    operators.LocalData
+    operators.LinearCoefficients
+    operators.PointNeighbours
+    operators.GridNeighbours
+```
+
+### Interpolators
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+
+    operators.interpolator.Nearest
+    operators.interpolator.ScipyInterpolator
+    operators.interpolator.Linear
+    operators.interpolator.Cubic
+    operators.interpolator.InverseDistance
+    operators.interpolator.RasterConvolution
+    operators.interpolator.Kriging
+```
+
+### Reducers
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+
+    operators.reducer.Mean
+    operators.reducer.Sum
+    operators.reducer.Quantile
+    operators.reducer.Median
+    operators.reducer.Mode
+    operators.reducer.Minimum
+    operators.reducer.Maximum
+    operators.reducer.Range
+    operators.reducer.Count
+    operators.reducer.RootMeanSquare
+    operators.reducer.StandardDeviation
+    operators.reducer.AverageDistance
+    operators.reducer.AveragePairwiseDistance
+```
+
+### Error models and propagation
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+
+    ErrorMagnitude
+    ErrorComponent
+    ErrorStructure
+    ErrorStructure.estimate
+    PropagationSummary
+    uncertainty.propagate
+    uncertainty.random_field
+```
+
+## Multiprocessing
+
+Pass a {class}`~geoutils.multiproc.MultiprocConfig` as `mp_config` to supported methods for **chunked execution**
+on GeoUtils objects. See {ref}`multiprocessing` for configuration and custom block examples.
+
+### Configuration and clusters
+
+Use {class}`~geoutils.multiproc.ClusterGenerator` to choose a {class}`~geoutils.multiproc.BasicCluster` (sequential)
+or {class}`~geoutils.multiproc.MpCluster` (parallel).
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+
+    multiproc.MultiprocConfig
+    multiproc.ClusterGenerator
+    multiproc.BasicCluster
+    multiproc.MpCluster
+```
+
+### Block functions
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+
+    multiproc.map_overlap
+    multiproc.map_collect
+```
+
+(profiling-api)=
+## Profiling
+
+Measure function runtime and memory, or collect decorated workflow calls. See {ref}`profiling` for examples.
+
+```{eval-rst}
+.. autosummary::
+    :toctree: gen_modules/
+    :template: module.rst
+
+    profiler
+
+.. autosummary::
+
+    profiler.profile_call
+    profiler.profile
+    profiler.ProfileMetrics
+    profiler.Profiler
 ```

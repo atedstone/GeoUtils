@@ -1,4 +1,4 @@
-# Copyright (c) 2025 GeoUtils developers
+# Copyright (c) 2026 GeoUtils developers
 #
 # This file is part of the GeoUtils project:
 # https://github.com/glaciohack/geoutils
@@ -20,13 +20,18 @@
 GeoUtils is a Python package for the analysis of geospatial data.
 """
 
-from geoutils import examples, projtools  # noqa
+from geoutils import examples, operators, projtools  # noqa
 from geoutils._config import config  # noqa
 
-from geoutils.raster import Raster, xr_accessor  # noqa isort:skip
-from geoutils.raster.xr_accessor import open_raster  # noqa isort:skip
-from geoutils.vector import Vector  # noqa isort:skip
-from geoutils.pointcloud import PointCloud  # noqa isort:skip
+from geoutils.raster import Raster, open_raster  # noqa isort:skip
+from geoutils.raster import DataArrayRasterAccessor, DatasetRasterAccessor  # noqa isort:skip
+from geoutils.vector import Vector, GeoDataFrameVectorAccessor, open_vector  # noqa isort:skip
+from geoutils.pointcloud import PointCloud, open_pointcloud  # noqa isort:skip
+from geoutils.pointcloud import GeoDataFramePointCloudAccessor  # noqa isort:skip
+from geoutils.pointcloud import DataArrayPointCloudAccessor, DatasetPointCloudAccessor  # noqa isort:skip
+from geoutils.stats.variography import Variogram  # noqa isort:skip
+from geoutils import uncertainty  # noqa isort:skip
+from geoutils.uncertainty import ErrorComponent, ErrorMagnitude, ErrorStructure, PropagationSummary  # noqa isort:skip
 
 # To-be-deprecated
 from geoutils.raster import Mask  # noqa isort:skip

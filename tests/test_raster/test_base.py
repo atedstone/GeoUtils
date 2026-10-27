@@ -2,98 +2,34 @@
 
 from __future__ import annotations
 
-import os
-from typing import Any
+import warnings
+from collections.abc import Callable
+from typing import Any, Literal
 
 import geopandas as gpd
 import numpy as np
-import pandas as pd
 import pytest
 import rasterio as rio
 import xarray as xr
 from packaging.version import Version
-from pandas.testing import assert_frame_equal
 from pyproj import CRS
+from pyproj.crs import CompoundCRS
 
-from geoutils import Raster, Vector, examples, open_raster
+import geoutils as gu
+from geoutils import (
+    ErrorComponent,
+    ErrorStructure,
+    Raster,
+    Variogram,
+    examples,
+    open_raster,
+)
+from geoutils.operators.reducer import Mean
 from geoutils.raster import MultiprocConfig
 from geoutils.raster.base import RasterBase
-from geoutils.raster.xr_accessor import RasterAccessor
-
-
-@pytest.fixture(scope="module")
-def lazy_test_files(tmp_path_factory: Any) -> list[str]:
-    """
-    Create temporary converted files for lazy tests.
-
-    Below, we compare Xarray accessor and Raster class including loading/laziness (without data loaded).
-    So we need to convert all of our integer test examples to float32 with valid nodata ahead of loading,
-    and save them to temporary test files.
-    """
-
-    # Create temporary directory at module scope
-    tmpdir = tmp_path_factory.mktemp("lazy_data")
-
-    list_name = ["everest_landsat_b4", "everest_landsat_rgb", "exploradores_aster_dem"]
-    list_fn_out = []
-    for name in list_name:
-
-        # Get filepath
-        fn = examples.get_path_test(name)
-
-        # If dataset is already float32 with defined nodata, return the path
-        if name == "exploradores_aster_dem":
-            list_fn_out.append(fn)
-            continue
-
-        # Else open, convert
-        rast = Raster(fn)
-        rast = rast.astype(dtype=np.float32, convert_nodata=False)
-        rast.set_nodata(-9999)
-
-        # Save to file in temporary directory
-        fn_out = os.path.join(tmpdir, os.path.splitext(os.path.basename(fn))[0] + "_float32.tif")
-        rast.to_file(fn_out)
-
-        list_fn_out.append(fn_out)
-
-    return list_fn_out
-
-
-def assert_output_equal(output1: Any, output2: Any, use_allclose: bool = False, strict_masked: bool = True) -> None:
-    """Return equality of different output types."""
-
-    # For two vectors
-    if isinstance(output1, Vector) and isinstance(output2, Vector):
-        assert output1.vector_equal(output2)
-
-    # For two raster: Xarray or Raster objects
-    elif isinstance(output1, (Raster, xr.DataArray)):
-        if use_allclose:
-            assert output1.raster_allclose(output2, warn_failure_reason=True, strict_masked=strict_masked)
-        else:
-            assert output1.raster_equal(output2, warn_failure_reason=True, strict_masked=strict_masked)
-
-    # For arrays
-    elif isinstance(output1, np.ndarray):
-        if np.ma.isMaskedArray(output1):
-            output1 = output1.filled(np.nan)
-        if np.ma.isMaskedArray(output2):
-            output2 = output2.filled(np.nan)
-        assert np.array_equal(output1, output2, equal_nan=True)
-
-    # For tuple of arrays
-    elif isinstance(output1, tuple) and isinstance(output1[0], np.ndarray):
-        assert np.array_equal(np.array(output1), np.array(output2), equal_nan=True)
-
-    # For a dictionary of numeric values
-    elif isinstance(output1, dict):
-        df1 = pd.DataFrame(index=[0], data=output1)
-        df2 = pd.DataFrame(index=[0], data=output2)
-        assert_frame_equal(df1, df2, check_dtype=False)
-    # For any other object type
-    else:
-        assert output1 == output2
+from geoutils.raster.xr_accessor import DataArrayRasterAccessor
+from tests.accessor_helpers import assert_output_equal
+from tests.remote_helpers import RemoteFiles
 
 
 def should_be_loaded(method: str, args: dict[str, Any], noload: list[str], noload_allowed_args: dict[str, Any]) -> bool:
@@ -116,6 +52,16 @@ def should_be_loaded(method: str, args: dict[str, Any], noload: list[str], noloa
     return should_output_be_loaded
 
 
+def test_coords_crs() -> None:
+    """Test coords functions with a target crs"""
+    dem = Raster(examples.get_path_test("everest_landsat_b4"))
+    dem.set_nodata(0)
+    dem_4326 = dem.reproject(crs=4326)
+    coords_proj_4326 = dem.coords(grid=True, shift_area_or_point=None, force_offset=None, crs=4326)
+    coords_4326 = dem_4326.coords(grid=True, shift_area_or_point=None, force_offset=None)
+    assert np.array_equal(coords_4326, coords_proj_4326)
+
+
 class NeedsTestError(ValueError):
     """Error to remember to add test when a new RasterBase method is added."""
 
@@ -136,7 +82,11 @@ class TestClassVsAccessorConsistency:
     # The full list of methods is used a posteriori to check all were tested across multiple tests
     methods = [k for k, v in RasterBase.__dict__.items() if not k.startswith("_") and not isinstance(v, property)]
     # Ignore deprecated methods (already tested through their new name)
-    methods = [m for m in methods if m not in ["to_points", "save"]]
+    methods = [
+        m
+        for m in methods
+        if m not in ["get_nanarray", "to_points", "save", "interp_points", "reduce_points", "get_stats"]
+    ]
 
     # List of properties that WILL load the input dataset (only one does, the data itself)
     properties_input_load = ["data"]
@@ -152,11 +102,14 @@ class TestClassVsAccessorConsistency:
         "coords",
         "outside_image",
         "info",
-        "get_bounds_projected",
+        "get_bbox_projected",
         "get_footprint_projected",
         "copy",
         "georeferenced_grid_equal",
         "intersection",
+        "edit",
+        "subsample",
+        "random_field",
     ]
     # List of methods that WILL NOT load the input for certain arguments
     methods_input_noload_allowed_args = {"info": {"stats": [False]}}
@@ -172,10 +125,89 @@ class TestClassVsAccessorConsistency:
         "set_transform",
         "set_nodata",
         "set_area_or_point",
+        "edit",
     ]
     # List of methods that WILL NOT LOAD the output for certain arguments
     # copy(new_array=not None) will load
     methods_output_noload_allowed_args = {"copy": {"deep": [True, False], "new_array": [None]}}
+
+    def test_geo_interface__bbox_polygon(self, lazy_test_files: list[str]) -> None:
+        """Checks that a raster exposes its bounding polygon without loading data."""
+
+        # Create matching class and accessor rasters with different X/Y pixel sizes
+        transform = rio.transform.from_origin(10, 20, 2, 3)
+        raster = Raster.from_array(np.ones((2, 3)), transform=transform, crs=32610)
+        array = DataArrayRasterAccessor.from_array(np.ones((2, 3)), transform=transform, crs=32610)
+        expected_bbox = rio.coords.BoundingBox(left=10, bottom=14, right=16, top=20)
+        expected_interface = {
+            "type": "Polygon",
+            "bbox": tuple(expected_bbox),
+            "coordinates": (((10.0, 14.0), (16.0, 14.0), (16.0, 20.0), (10.0, 20.0), (10.0, 14.0)),),
+        }
+
+        # Check the common name and compatibility alias through both APIs, and the protocol on the Raster
+        assert raster.bbox == expected_bbox
+        assert raster.bounds == expected_bbox
+        assert array.rst.bbox == expected_bbox
+        assert array.rst.bounds == expected_bbox
+        assert raster.__geo_interface__ == expected_interface
+
+        # Read only file metadata and check that creating the mapping leaves the raster values unloaded
+        file_raster = Raster(lazy_test_files[0])
+        assert file_raster.__geo_interface__["bbox"] == tuple(file_raster.bbox)
+        assert not file_raster.is_loaded
+
+    def test_info__crs_name(self) -> None:
+        """Checks that info reports the CRS name for 2D, compound and missing CRS metadata."""
+
+        # 1/ Define the CRS cases and the small raster shared by both APIs
+        horizontal_crs = CRS.from_epsg(32610)
+        compound_crs = CompoundCRS("Horizontal and vertical test CRS", [horizontal_crs, CRS.from_epsg(5773)])
+        transform = rio.transform.from_origin(0, 2, 1, 1)
+        crs_cases = [
+            (horizontal_crs, "WGS 84 / UTM zone 10N"),
+            (compound_crs, "Horizontal and vertical test CRS"),
+            (None, None),
+        ]
+
+        # 2/ Check that Raster and the Xarray accessor report the same readable name
+        for crs, expected_name in crs_cases:
+            raster = Raster.from_array(np.ones((2, 2)), transform=transform, crs=crs)
+            ds = DataArrayRasterAccessor.from_array(np.ones((2, 2)), transform=transform, crs=crs)
+            expected_line = f"Coordinate system:    {[expected_name]}"
+
+            assert expected_line in raster.info(verbose=False).split("\n")
+            assert expected_line in ds.rst.info(verbose=False).split("\n")
+
+    def test_georeferenced_grid_equal__vertical_and_missing_crs(self) -> None:
+        """Checks that grid equality ignores vertical CRS differences, warns optionally and accepts missing CRS."""
+
+        # 1/ Create matching rasters with horizontal-only and compound CRS metadata
+        horizontal_crs = CRS.from_epsg(32610)
+        compound_crs = CompoundCRS("Horizontal and vertical test CRS", [horizontal_crs, CRS.from_epsg(5773)])
+        transform = rio.transform.from_origin(0, 2, 1, 1)
+        horizontal = Raster.from_array(np.ones((2, 2)), transform=transform, crs=horizontal_crs)
+        compound = DataArrayRasterAccessor.from_array(np.ones((2, 2)), transform=transform, crs=compound_crs)
+
+        # 2/ Check that the vertical difference warns but does not change horizontal grid equality
+        with pytest.warns(UserWarning, match="same 2D CRS but a different vertical CRS"):
+            assert horizontal.georeferenced_grid_equal(compound)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            # Ignore the Affine 3.1 transition warning emitted inside Rioxarray
+            warnings.filterwarnings(
+                "ignore",
+                message=r"Use `@` matmul instead of `\*` mul operator for matrix multiplication",
+                category=PendingDeprecationWarning,
+            )
+            assert horizontal.georeferenced_grid_equal(compound, warn_3d_crs=False)
+
+        # 3/ Check that missing CRS metadata compares safely
+        without_crs = Raster.from_array(np.ones((2, 2)), transform=transform, crs=None)
+        other_without_crs = DataArrayRasterAccessor.from_array(np.ones((2, 2)), transform=transform, crs=None)
+
+        assert without_crs.georeferenced_grid_equal(other_without_crs)
+        assert not horizontal.georeferenced_grid_equal(without_crs)
 
     @pytest.mark.parametrize("path_index", [0, 1, 2])
     @pytest.mark.parametrize("prop", properties)
@@ -225,12 +257,13 @@ class TestClassVsAccessorConsistency:
         ),  # "random" will be derived during the test to work on all inputs
         ("icrop", {"bbox": (3, 5, 10, 22)}),
         ("translate", {"xoff": 10.5, "yoff": 5}),
+        ("edit", {"crs": CRS.from_epsg(4326), "tags": {"edited": "true"}}),
         ("xy2ij", {"x": "random", "y": "random"}),  # "random" will be derived during the test to work on all inputs
         ("ij2xy", {"i": [0, 1, 2, 3], "j": [4, 5, 6, 7]}),
         ("coords", {"grid": True}),
         ("get_metric_crs", {"local_crs_type": "universal"}),
         ("get_footprint_projected", {"out_crs": CRS.from_epsg(4326)}),
-        ("get_bounds_projected", {"out_crs": CRS.from_epsg(4326)}),
+        ("get_bbox_projected", {"out_crs": CRS.from_epsg(4326)}),
         ("georeferenced_grid_equal", {"other": "self"}),
         ("outside_image", {"xi": [-2, 10000, 10], "yj": [10, 50, 20]}),
         # 1.2. In-place methods
@@ -242,23 +275,89 @@ class TestClassVsAccessorConsistency:
         # 2/ This second list of methods will load the input Raster (access .data)
         # 2.1. Not in-place
         ("copy", {"new_array": "placeholder"}),  # Copy with new array does load! Will create array of right size below.
+        ("clip", {"mask": "random"}),
         ("info", {"stats": True, "verbose": False}),  # Info with stats loads
+        ("plot", {"max_pixels": 1_000, "add_cbar": False}),
         ("reproject", {"crs": CRS.from_epsg(4326)}),
         ("raster_equal", {"other": "self"}),
         ("raster_allclose", {"other": "self"}),
         ("intersection", {"other": "self"}),
-        ("reduce_points", {"points": "random"}),  # Needs implementation in RasterBase (currently only for Raster)
-        ("interp_points", {"points": "random"}),  # "random" will be derived during the test to work on all inputs
+        ("reduce_at_points", {"points": "random"}),  # Needs implementation in RasterBase (currently only for Raster)
+        ("interp_at_points", {"points": "random"}),  # "random" will be derived during the test to work on all inputs
+        ("resample_at_points", {"points": "random", "method": Mean(), "as_array": True}),
         ("proximity", {"target_values": [100]}),
-        ("get_nanarray", {}),
+        ("to_nanarray", {}),
         ("to_pointcloud", {"subsample": 1, "random_state": 42}),
         ("polygonize", {"target_values": "all"}),
         ("subsample", {"subsample": 1000, "random_state": 42}),
+        ("cosample", {"other": "self", "subsample": 1_000, "random_state": 42}),
+        (
+            "estimate_error_structure",
+            {
+                "other": "reference",
+                "other_precision": "negligible",
+                "components": {"measurement": {"magnitude": "constant", "correlation": None}},
+                "spread_estimator": np.std,
+                "subsample_magnitude": 256,
+                "random_state": 42,
+            },
+        ),
+        ("pairsample", {"n_pairs": 1_000, "random_state": 42}),
+        ("variogram", {"n_pairs": 1_000, "n_lags": 6, "random_state": 42}),
+        (
+            "krige",
+            {
+                "variogram": Variogram.from_model("gaussian", effective_range=1, partial_sill=1),
+                "max_overlap": 0.01,
+            },
+        ),
+        (
+            "random_field",
+            {
+                "error_structure": ErrorStructure([ErrorComponent("measurement", 1)]),
+                "random_state": 42,
+            },
+        ),
         ("filter", {"method": "median", "size": 7}),
-        ("get_stats", {}),
+        ("sieve", {"size": 7}),
+        ("fill_nodata", {"max_search_distance": 3}),
+        ("stats", {}),
+        ("stats", {"by": {"group": 1}, "bins": {"group": 2}, "statistics": "mean"}),
         # 2.2. In-place methods
         ("load", {}),
     ]
+
+    @pytest.mark.parametrize(
+        "method,kwargs",
+        [
+            (method, kwargs)
+            for method, kwargs in methods_and_kwargs
+            if method in ("copy", "crop", "icrop", "clip", "translate", "reproject", "filter", "sieve", "fill_nodata")
+            and not kwargs.get("inplace")
+        ],
+    )
+    def test_methods__metadata(self, method: str, kwargs: dict[str, Any]) -> None:
+        """Checks that operations preserve custom metadata."""
+
+        # Create integer raster with custom metadata
+        values = np.arange(36, dtype=np.int32).reshape(6, 6)
+        tags = {"title": "elevation survey", "units": "m"}
+        source = Raster.from_array(values, rio.transform.from_origin(0, 60, 10, 10), 32631, nodata=-99999, tags=tags)
+        original = source.copy()
+        options = kwargs.copy()
+        if method == "crop":
+            options["bbox"] = (10, 10, 50, 50)
+        elif method == "clip":
+            options["mask"] = (10, 10, 50, 50)
+        elif method == "copy" and "new_array" in options:
+            options["new_array"] = np.ones(source.shape, dtype=np.int32)
+
+        # Run each operation and check metadata is unchanged
+        result = getattr(source, method)(**options)
+        assert isinstance(result, Raster)
+        assert all(result.tags[name] == value for name, value in tags.items())
+        assert source.tags == original.tags
+        assert source.raster_equal(original)
 
     @pytest.mark.parametrize("path_index", [0, 1, 2])
     @pytest.mark.parametrize("method, kwargs", [(f, k) for f, k in methods_and_kwargs])
@@ -279,6 +378,27 @@ class TestClassVsAccessorConsistency:
         # Open both objects
         ds = open_raster(path_raster)
         raster = Raster(path_raster)
+        if method == "variogram":
+            pytest.importorskip("skgstat")
+
+        # Sieve follows GDAL and accepts integer categories rather than continuous values
+        if method == "sieve":
+            source_data = raster.data
+            integer_data = np.ma.array(source_data.data.astype(np.int32), mask=np.ma.getmaskarray(source_data))
+            raster = Raster.from_array(
+                integer_data,
+                transform=raster.transform,
+                crs=raster.crs,
+                nodata=-99999,
+                area_or_point=raster.area_or_point,
+            )
+            ds = DataArrayRasterAccessor.from_array(
+                integer_data.filled(-99999),
+                transform=raster.transform,
+                crs=raster.crs,
+                nodata=-99999,
+                area_or_point=raster.area_or_point,
+            )
 
         # For methods that require knowledge of the data (relative to bounds), create specific inputs
         args = kwargs.copy()
@@ -300,13 +420,34 @@ class TestClassVsAccessorConsistency:
                 raster.bounds.bottom + 411,
             )
             args.update({"bbox": bbox})
+        elif method == "clip":
+            mask = (
+                raster.bounds.left + 100,
+                raster.bounds.bottom + 200,
+                raster.bounds.left + 320,
+                raster.bounds.bottom + 411,
+            )
+            args.update({"mask": mask})
         elif method in ["raster_equal", "raster_allclose", "georeferenced_grid_equal", "intersection"]:
             args.update({"other": ds.copy(deep=False)})
+        elif method == "cosample":
+            args.update({"other": raster})
+        elif method == "estimate_error_structure":
+            args["other"] = raster.copy(new_array=np.zeros_like(raster.data, dtype=float))
         elif method == "copy" and "new_array" in args:
             args.update({"new_array": np.ones(ds.shape)})
 
+        # Load both inputs because clip() needs their raster values
+        if method == "clip":
+            raster.load()
+            ds.load()
+
         # Apply method for each class
         output_raster = getattr(raster, method)(**args)
+        if method == "cosample":
+            args.update({"other": ds.copy(deep=False)})
+        elif method == "estimate_error_structure":
+            args["other"] = args["other"].to_xarray()
         output_ds = getattr(ds.rst, method)(**args)
 
         # Determine if operation was in-place or not
@@ -327,7 +468,11 @@ class TestClassVsAccessorConsistency:
                 noload_allowed_args=self.methods_input_noload_allowed_args,
             )
             assert raster.is_loaded is should_input_be_loaded
-            assert ds._in_memory is should_input_be_loaded
+            # Xarray loads source values to derive a mask for sampling or a random field; Raster reads only its mask
+            if method in ("subsample", "random_field"):
+                assert ds._in_memory
+            else:
+                assert ds._in_memory is should_input_be_loaded
 
         # In the case of a Raster / DataArray output, check if output is loaded or not
         # (apart from in-place metadata setting, only a few functions don't load output, such as: crop/icrop, copy,
@@ -339,9 +484,7 @@ class TestClassVsAccessorConsistency:
                 noload=self.methods_output_noload,
                 noload_allowed_args=self.methods_output_noload_allowed_args,
             )
-            # TODO: Raster class does not load input, but does load output for "crop/icrop"
-            if method not in ["crop", "icrop"]:
-                assert output_raster.is_loaded is should_output_be_loaded
+            assert output_raster.is_loaded is should_output_be_loaded
             assert output_ds._in_memory is should_output_be_loaded
 
         # Finally, assert exact equality of outputs
@@ -387,7 +530,7 @@ class TestClassVsAccessorConsistency:
 
         # Accessor only uses this internally, but we expose it as a class method anyway
         output_raster = getattr(Raster, method)(**kwargs)
-        output_ds = getattr(RasterAccessor, method)(**kwargs)
+        output_ds = getattr(DataArrayRasterAccessor, method)(**kwargs)
 
         assert_output_equal(output_raster, output_ds)
 
@@ -402,9 +545,17 @@ class TestClassVsAccessorConsistency:
         if len(list_missing) != 0:
             raise AssertionError(f"RasterBase methods not covered by tests: {list_missing}")
 
-    chunked_methods_and_args = (("reproject", {"crs": CRS.from_epsg(4326)}),)
+    chunked_methods_and_args = (
+        ("reproject", {"crs": CRS.from_epsg(4326)}),
+        ("interp_at_points", {"points": "random", "as_array": True}),
+        ("cosample", {"other": "self", "subsample": 100, "strategy": "topk", "random_state": 42}),
+        (
+            "subsample",
+            {"subsample": 100, "random_state": 42, "strategy": "topk", "as_array": True},
+        ),
+    )
 
-    @pytest.mark.parametrize("path_index", [0, 2])
+    @pytest.mark.parametrize("path_index", [0, 1, 2])
     @pytest.mark.parametrize("method, kwargs", [(f, k) for f, k in chunked_methods_and_args])
     def test_chunked_methods__equality_loading_laziness(
         self, path_index: int, method: str, kwargs: dict[str, Any], lazy_test_files: list[str]
@@ -427,9 +578,9 @@ class TestClassVsAccessorConsistency:
         path_raster = lazy_test_files[path_index]
 
         # Open lazily with Dask
-        ds = open_raster(path_raster, chunks={"band": 1, "x": 10, "y": 10})
+        ds = open_raster(path_raster, chunks={"band": 1, "x": 25, "y": 25})
         # Open raster that will be processed using Multiprocessing
-        mp_config = MultiprocConfig(chunk_size=10)  # To pass to the function
+        mp_config = MultiprocConfig(chunks=25)  # To pass to the function
         raster = Raster(path_raster)
         # Open and load both DataArray/Raster with NumPy
         ds2 = open_raster(path_raster)
@@ -437,46 +588,89 @@ class TestClassVsAccessorConsistency:
         raster2 = Raster(path_raster)
         raster2.load()
 
-        # Apply method for each
-        output_raster = getattr(raster, method)(**kwargs, multiproc_config=mp_config)
-        output_ds = getattr(ds.rst, method)(**kwargs)
-        output_raster2 = getattr(raster2, method)(**kwargs)
-        output_ds2 = getattr(ds2.rst, method)(**kwargs)
+        # Special arguments
+        if "points" in method:
+            rng = np.random.default_rng(seed=42)
+            ninterp = 10
+            res = raster.res
+            interp_x = raster.bounds.left + (rng.choice(raster.shape[0], ninterp) + rng.random(ninterp)) * res[0]
+            interp_y = raster.bounds.bottom + (rng.choice(raster.shape[1], ninterp) + rng.random(ninterp)) * res[1]
+            kwargs.update({"points": (interp_x, interp_y)})
 
-        # 1/ For Dask object: both inputs and outputs should be unloaded + lazy, and compute
-        # Input
-        assert not ds._in_memory
-        assert isinstance(ds.data, da.Array)
-        assert ds.data.chunks is not None
-        # Output
-        assert not output_ds._in_memory
-        assert isinstance(output_ds.data, da.Array)
-        assert output_ds.data.chunks is not None
-        # Output computes successfully, and is then loaded in memory
-        output_ds = output_ds.compute()
-        assert isinstance(output_ds.data, np.ndarray)
-        assert output_ds._in_memory
+        # Apply the same method through each backend, pairing cosample with its own input representation
+        outputs = []
+        for source, backend in ((raster, mp_config), (ds.rst, None), (raster2, None), (ds2.rst, None)):
+            options = kwargs.copy()
+            if method == "cosample":
+                options["other"] = source
+            if backend is not None:
+                options["mp_config"] = backend
+            outputs.append(getattr(source, method)(**options))
+        output_raster, output_ds, output_raster2, output_ds2 = outputs
 
-        # 2/ For Multiprocessing, same for loading
-        assert not raster.is_loaded
-        assert not output_raster.is_loaded
+        # For a raster-type output (reprojection, rasterize, create_mask, proximity, etc...)
+        if isinstance(output_raster, Raster):
+            # 1/ For Dask object: both inputs and outputs should be unloaded + lazy, and compute
+            # Input
+            assert not ds._in_memory
+            assert isinstance(ds.data, da.Array)
+            assert ds.data.chunks is not None
+            # Output
+            assert not output_ds._in_memory
+            assert isinstance(output_ds.data, da.Array)
+            assert output_ds.data.chunks is not None
+            # Output computes successfully, and is then loaded in memory
+            output_ds = output_ds.compute()
+            assert isinstance(output_ds.data, np.ndarray)
+            assert output_ds._in_memory
 
-        # 3/ For non-Dask array, both should be loaded
-        assert ds2._in_memory
-        assert isinstance(ds2.data, np.ndarray)
-        assert output_ds2._in_memory
-        assert isinstance(output_ds2.data, np.ndarray)
+            # 2/ For Multiprocessing, same for loading
+            assert not raster.is_loaded
+            assert not output_raster.is_loaded
 
-        # 4/ For raster, same
-        assert raster2.is_loaded
-        assert output_raster2.is_loaded
+            # 3/ For non-Dask array, both should be loaded
+            assert ds2._in_memory
+            assert isinstance(ds2.data, np.ndarray)
+            assert output_ds2._in_memory
+            assert isinstance(output_ds2.data, np.ndarray)
+
+            # 4/ For raster, same
+            assert raster2.is_loaded
+            assert output_raster2.is_loaded
+
+        # For an array-type output (interpolation, subsampling, reduction, ...)
+        elif isinstance(output_raster, np.ndarray):
+            # 1/ For Dask object: both inputs and outputs should be unloaded + lazy, and compute
+            # Input
+            assert not ds._in_memory
+            assert isinstance(ds.data, da.Array)
+            assert ds.data.chunks is not None
+            # Output
+            assert isinstance(output_ds, da.Array)
+            assert output_ds.chunks is not None
+            # Output computes successfully, and is then loaded in memory
+            output_ds = output_ds.compute()
+            assert isinstance(output_ds, np.ndarray)
+
+            # 2/ For Multiprocessing, same for loading
+            assert not raster.is_loaded
+            assert isinstance(output_raster, np.ndarray)
+
+            # 3/ For non-Dask array, both should be loaded
+            assert ds2._in_memory
+            assert isinstance(ds2.data, np.ndarray)
+            assert isinstance(output_ds2, np.ndarray)
+
+            # 4/ For raster, same
+            assert raster2.is_loaded
+            assert isinstance(output_raster2, np.ndarray)
 
         # Check all outputs are exactly the same
         # (For reproject, no artefacts only since we added "tolerance" argument in Rasterio,
         # which officially came out in 1.5; so we skip the test for earlier versions)
         if method == "reproject" and Version(rio.__version__) < Version("1.5.0"):
             return
-        assert_output_equal(output_raster, output_ds)  # Same chunk sizes, so exact same numerics
+        assert_output_equal(output_raster, output_ds, use_allclose=True)
         assert_output_equal(output_raster, output_raster2, use_allclose=True, strict_masked=False)
         assert_output_equal(output_raster, output_ds2, use_allclose=True)
 
@@ -490,3 +684,195 @@ class TestClassVsAccessorConsistency:
 
         # TODO: Finalize after consistent input check function #850
         assert True
+
+
+class TestRasterEdit:
+    """Check grouped metadata changes without modifying source raster data or metadata."""
+
+    def test_edit(self) -> None:
+        """Apply core GDAL-style metadata edits to a shallow raster copy."""
+
+        transform = rio.transform.from_origin(0, 2, 1, 1)
+        raster = Raster.from_array(
+            np.ones((2, 2), dtype=np.int16),
+            transform=transform,
+            crs=4326,
+            nodata=-9999,
+            tags={"source": "test"},
+            area_or_point="Area",
+        )
+        new_transform = rio.transform.from_origin(10, 20, 2, 2)
+
+        # Omitted metadata is retained while tags are merged with the existing values
+        edited = raster.edit(
+            crs=32631,
+            transform=new_transform,
+            nodata=-32768,
+            tags={"edited": "true"},
+            area_or_point="Point",
+        )
+        assert edited.crs == rio.crs.CRS.from_epsg(32631)
+        assert edited.transform == new_transform
+        assert edited.nodata == -32768
+        assert edited.tags["source"] == "test"
+        assert edited.tags["edited"] == "true"
+        assert edited.area_or_point == "Point"
+
+        # Editing metadata does not alter the source raster
+        assert raster.crs == rio.crs.CRS.from_epsg(4326)
+        assert raster.transform == transform
+        assert raster.nodata == -9999
+        assert raster.tags == {"source": "test", "AREA_OR_POINT": "Area"}
+        assert np.array_equal(edited.data, raster.data)
+
+    def test_edit_clear_metadata(self) -> None:
+        """Distinguish omitted arguments from metadata explicitly cleared with None."""
+
+        raster = Raster.from_array(
+            np.ones((2, 2), dtype=np.float32),
+            transform=rio.transform.from_origin(0, 2, 1, 1),
+            crs=4326,
+            nodata=-9999,
+            tags={"source": "test"},
+        )
+        edited = raster.edit(crs=None, nodata=None, tags=None, area_or_point=None)
+        assert edited.crs is None
+        assert edited.nodata is None
+        assert edited.tags == {}
+        assert edited.area_or_point is None
+
+
+@pytest.fixture
+def remote_raster(remote_files: RemoteFiles) -> str:
+    """Write a tile-by-tile GeoTIFF to a "mocked" remote cloud file."""
+
+    values = np.arange(256 * 256, dtype="float32").reshape(256, 256)
+    values[0, 0] = -9999
+    filename = remote_files.directory / "raster.tif"
+    with rio.open(
+        filename,
+        "w",
+        driver="COG",
+        width=256,
+        height=256,
+        count=1,
+        dtype=values.dtype,
+        crs=32633,
+        transform=rio.transform.from_origin(500000, 5100000, 10, 10),
+        nodata=-9999,
+        blocksize=128,
+    ) as destination:
+        destination.write(values, 1)
+    return filename.name
+
+
+class TestRasterRemote:
+    """Test module for remote raster reading (in the cloud)."""
+
+    @pytest.mark.parametrize("load_data", [True, False])
+    def test_init__remote(
+        self, remote_files: RemoteFiles, remote_url: Callable[[str], str], remote_raster: str, load_data: bool
+    ) -> None:
+        """Checks that instantiating a Raster on a remote file in the cloud works properly."""
+
+        # Open both as remote/local
+        expected = gu.Raster(remote_files.directory / remote_raster, load_data=True)
+        remote = gu.Raster(remote_url(remote_raster), load_data=load_data)
+
+        # Check loading, metadata and exact equality after loading
+        assert remote.is_loaded == load_data
+        assert remote.crs == expected.crs
+        assert remote.transform == expected.transform
+        assert remote.bounds == expected.bounds
+        assert remote.shape == expected.shape
+        assert remote.nodata == expected.nodata
+        if not load_data:
+            remote.load()
+        assert remote.is_loaded
+        assert remote.raster_equal(expected)
+
+        # Check that remote reads requested part of a file
+        assert any(method == "GET" and byte_range for method, path, byte_range in remote_files.requests)
+
+    @pytest.mark.parametrize("as_object_type", ["dataarray", "dataset"])
+    def test_open_raster__remote(
+        self,
+        remote_files: RemoteFiles,
+        remote_url: Callable[[str], str],
+        remote_raster: str,
+        as_object_type: Literal["dataarray", "dataset"],
+    ) -> None:
+        """Checks that open_raster() works properly on a remote file in the cloud."""
+
+        # Open both local/remote
+        expected = gu.open_raster(
+            str(remote_files.directory / remote_raster), as_object_type=as_object_type, data_name="height"
+        )
+        remote = gu.open_raster(remote_url(remote_raster), as_object_type=as_object_type, data_name="height")
+
+        # Check equality, and close the backing file handles
+        try:
+            xr.testing.assert_identical(remote, expected)
+            assert remote.rio.crs == expected.rio.crs
+        finally:
+            remote.close()
+            expected.close()
+
+        # Check that remote reads requested part of a file
+        assert any(method == "GET" and byte_range for method, path, byte_range in remote_files.requests)
+
+
+class TestRasterRemoteChunked:
+    """Test module for remote raster files with lazy/chunked Dask reading."""
+
+    def test_open_raster__remote_laziness(
+        self, remote_files: RemoteFiles, remote_url: Callable[[str], str], remote_raster: str
+    ) -> None:
+        """Checks that remote raster chunks stay lazy and compute exactly the in-memory local raster."""
+
+        pytest.importorskip("dask")
+
+        # Open both local/remote with chunks (Dask)
+        expected = gu.open_raster(str(remote_files.directory / remote_raster)).load()
+        remote = gu.open_raster(remote_url(remote_raster), chunks={"x": 90, "y": 70})
+        assert expected.rst.is_loaded
+        assert not remote.rst.is_loaded
+        assert remote.chunks is not None
+        requests_before_compute = len(remote_files.requests)
+
+        # Compute and check equality, without loading the original lazy object
+        try:
+            computed = remote.compute(scheduler="synchronous")
+            xr.testing.assert_identical(computed, expected)
+            assert computed.rst.is_loaded
+            assert not remote.rst.is_loaded
+            assert len(remote_files.requests) > requests_before_compute
+        finally:
+            remote.close()
+            expected.close()
+
+        # Check that remote reads requested part of a file
+        assert any(method == "GET" and byte_range for method, path, byte_range in remote_files.requests)
+
+
+class TestRasterRemoteErrors:
+    """Test module for errors/warnings for raster remote files."""
+
+    def test_init__error_missing_remote_file(self, remote_url: Callable[[str], str]) -> None:
+        """Checks an error is raised when a remote raster file is unavailable."""
+        with pytest.raises(rio.errors.RasterioIOError):
+            gu.Raster(remote_url("missing.tif"))
+
+    @pytest.mark.parametrize("as_object_type", ["dataarray", "dataset"])
+    @pytest.mark.parametrize("chunks", [None, {"x": 90, "y": 70}])
+    def test_open_raster__error_missing_remote_file(
+        self,
+        remote_url: Callable[[str], str],
+        as_object_type: Literal["dataarray", "dataset"],
+        chunks: dict[str, int] | None,
+    ) -> None:
+        """Checks an error is raised when open_raster() cannot find a remote file, with or without chunks."""
+
+        filename = remote_url("missing.tif")
+        with pytest.raises(rio.errors.RasterioIOError):
+            gu.open_raster(filename, as_object_type=as_object_type, chunks=chunks)

@@ -4,6 +4,17 @@
 # pycharm
 .idea/
 
+# codex
+.codex
+AGENTS.md
+.agents
+
+# Default local ASV outputs
+.asv/
+
+# Local benchmark environments, measurements and reports
+benchmarks/results/
+
 # sphinx documentation
 doc/_build/
 
@@ -148,12 +159,16 @@ doc/source/gen_modules/
 # Temporary files that can appear if doc build fails
 doc/source/myraster.tif
 doc/source/myvector.gpkg
+doc/source/myraster1.tif
+doc/source/myraster2.tif
+
 
 # Directories where example data is downloaded
 geoutils/example_data/
 
 # Directory where myst_nb executes jupyter code
 doc/jupyter_execute/
+doc/.jupyter_cache/
 doc/source/sg_execution_times.rst
 
 # Files that should have been deleted by Sphinx at end of build (but can exist if build fails)

@@ -21,23 +21,28 @@ title: GeoUtils
 :class: sd-fs-3
 :child-align: center
 
-GeoUtils is a Python package for **accessible** and **consistent** geospatial analysis.
+GeoUtils is a Python package for **scalable**, **composable** and **accessible** geospatial analysis.
 ::::
 
 ```{important}
 :class: margin
-GeoUtils ``v0.2`` is released with more consistent point cloud support! We are working on Xarray and GeoPandas accessors for all data objects, as well as other scalability features.
+GeoUtils ``v0.3`` introduces Xarray/GeoPandas accessors and finalizes Dask support for all raster and point cloud operations (with benchmarking)! GPU support is planned as we refine the API before a ``v1.0``.
 ```
 
-GeoUtils is built on top of core geospatial packages (Rasterio, GeoPandas, PyProj) and numerical packages
-(NumPy, Xarray, SciPy) to provide **consistent higher-level functionalities at the interface of raster, vector and point
-cloud objects** (such as match-reference reprojection, point interpolation or gridding).
+GeoUtils is built on top of core geospatial packages (Rasterio, Shapely, PyProj) and numerical packages
+(NumPy, SciPy, Numba) to provide **higher-level tools** for raster, vector and point
+cloud objects, from transformations (e.g., reprojection, polygonization, point gridding) to
+geostatistics (e.g., variography, random fields, kriging), and much more.
 
-It is **tailored to perform quantitative analysis that implicitly understands the intricacies of geospatial data**
-(nodata values, projection, pixel interpretation), through **an intuitive object-based API to foster accessibility**,
-and strives **to be computationally scalable** (Dask support in development for future Xarray accessor).
+It adds **scalable** implementation respecting lazy and chunked execution (Dask, multiprocessing) for all raster
+and point cloud operations and some vector operations, and is **composable** by exposing customizable methods
+and backends that can be reused across operations. It also provides **accessors** to naturally extend
+existing Python data structures (Xarray, GeoPandas).
 
-If you are looking to **port your GDAL or QGIS workflow in Python**, GeoUtils is made for you!
+Finally, it strives to make quantitative analysis **accessible** through an intuitive API, similar in spirit to
+GDAL's overhauled CLI, while accounting implicitly for geospatial intricacies (nodata values, projections, pixel interpretation).
+
+If you are looking to **port your GDAL or QGIS workflow in Python** while supporting large datasets, GeoUtils is made for you!
 
 ----------------
 
@@ -53,7 +58,7 @@ If you are looking to **port your GDAL or QGIS workflow in Python**, GeoUtils is
 Learn more about why we developed GeoUtils.
 
 +++
-[Learn more »](about_geoutils)
+{ref}`Learn more » <about-geoutils>`
 :::
 
 :::{grid-item-card} {material-regular}`data_exploration;2em` Quick start
@@ -63,7 +68,7 @@ Learn more about why we developed GeoUtils.
 Run a short example of the package functionalities.
 
 +++
-[Learn more »](quick_start)
+{ref}`Learn more » <quick-start>`
 :::
 
 :::{grid-item-card} {material-regular}`preview;2em` Features
@@ -73,12 +78,10 @@ Run a short example of the package functionalities.
 Dive into the full documentation.
 
 +++
-[Learn more »](core_index)
+{ref}`Learn more » <core-index>`
 :::
 
 ::::
-
-Prefer to **grasp GeoUtils' core concepts by comparing with other Python packages**? Read through a short **{ref}`side-by-side code comparison with Rasterio and GeoPandas<comparison-rasterio-geopandas>`**.
 
 Looking to **learn a specific feature by running an example**? Jump straight into our **example galleries on {ref}`examples-io`, {ref}`examples-handling` and {ref}`examples-analysis`**.
 
@@ -105,14 +108,26 @@ feature_overview
 :maxdepth: 2
 
 core_index
-data_object_index
-georeferencing
-geotransformations
-raster_vector_point
-distance_ops
-stats
+scalability_index
+data_struct_index
+referencing
+transformations
+proximity
 filters
+gapfill
+sampling
+stats
+uncertainty
 ```
+
+```{toctree}
+:caption: Resources
+:maxdepth: 2
+
+cheatsheet_osgeo
+ecosystem
+```
+
 
 ```{toctree}
 :caption: Examples
@@ -128,8 +143,9 @@ analysis_examples/index
 :maxdepth: 2
 
 api
-cli
 config
+benchmarking_index
+cli
 data
 release_notes
 ```
@@ -138,11 +154,11 @@ release_notes
 :caption: Project information
 :maxdepth: 2
 
+contributing
 credits
 ```
 
 # Indices and tables
 
 - {ref}`genindex`
-- {ref}`modindex`
 - {ref}`search`
